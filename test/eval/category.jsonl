@@ -1,0 +1,50 @@
+{"text":"Write a Python script to monitor my room temperature and text me if it gets too hot","label":"code"}
+{"text":"Refactor the auth middleware to use async/await","label":"code"}
+{"text":"Plan the migration of our Go service to gRPC","label":"code"}
+{"text":"Fix this bug: user.email is undefined in the signup handler","label":"code"}
+{"text":"Add a Terraform module for an S3 bucket with versioning and a lifecycle rule","label":"code"}
+{"text":"Review this PR diff and tell me what could break","label":"code"}
+{"text":"Why does this React Native FlatList re-render on every keystroke? Here's the component","label":"code"}
+{"text":"Design the database schema for a multi-tenant invoicing app","label":"code"}
+{"text":"Write unit tests for the parseConfig function","label":"code"}
+{"text":"Convert this bash script to a Makefile","label":"code"}
+{"text":"Set up a GitHub Actions workflow that runs pytest on every push","label":"code"}
+{"text":"The build fails with 'cannot find module @/lib/utils', help me fix the tsconfig paths","label":"code"}
+{"text":"Break this feature into an implementation plan with milestones","label":"code"}
+{"text":"Optimize this SQL query, it takes 4 seconds on 2M rows","label":"code"}
+{"text":"What's the weather in Chicago right now?","label":"live"}
+{"text":"Who won the Lakers game last night?","label":"live"}
+{"text":"What's the latest version of Next.js and what changed?","label":"live"}
+{"text":"Is there an outage on AWS us-east-1 at the moment?","label":"live"}
+{"text":"How is traffic on I-90 into the city this morning?","label":"live"}
+{"text":"What is the current price of Bitcoin?","label":"live"}
+{"text":"Any breaking news about the Fed rate decision today?","label":"live"}
+{"text":"Did Bun ship a new release this week?","label":"live"}
+{"text":"What time does the Apple event start today in Pacific time?","label":"live"}
+{"text":"Find the current docs for the Stripe Checkout Sessions API","label":"live"}
+{"text":"What are people saying about the new iPhone on Hacker News today?","label":"live"}
+{"text":"Is the Ollama 0.31 release out yet?","label":"live"}
+{"text":"What's the USD to EUR exchange rate right now?","label":"live"}
+{"text":"Check if github.com is down","label":"live"}
+{"text":"Explain what a mutex is","label":"general"}
+{"text":"thanks, that worked","label":"general"}
+{"text":"What's the difference between TCP and UDP?","label":"general"}
+{"text":"Write a short thank-you note to my team for shipping the release","label":"general"}
+{"text":"Summarize the idea of CAP theorem in two sentences","label":"general"}
+{"text":"What does idempotent mean?","label":"general"}
+{"text":"Give me a good name for a dog","label":"general"}
+{"text":"ok, continue","label":"general"}
+{"text":"Translate 'good morning' into Arabic","label":"general"}
+{"text":"How do I politely decline a meeting?","label":"general"}
+{"text":"What year did the Berlin Wall fall?","label":"general"}
+{"text":"Explain the difference between OAuth and OIDC like I'm new to it","label":"general"}
+{"text":"Draft a LinkedIn post announcing our seed round","label":"general"}
+{"text":"Is a tomato a fruit or a vegetable?","label":"general"}
+{"text":"Read /tmp/notes.txt with your read tool and tell me what kind of file it is.","label":"code"}
+{"text":"What's in package.json?","label":"code"}
+{"text":"List the files in this directory","label":"code"}
+{"text":"Which version of Node is installed on this machine?","label":"code"}
+{"text":"Show me the latest git commit and what it changed","label":"code"}
+{"text":"Is anything already listening on port 3000?","label":"code"}
+{"text":"Summarize the log file at ~/Downloads/server.log","label":"code"}
+{"text":"What does the README in this repo say about installation?","label":"code"}

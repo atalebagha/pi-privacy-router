@@ -1,0 +1,62 @@
+{
+	"name": "pi-privacy-router",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Privacy-aware model router for the pi coding agent: a local classifier sends coding to Claude and live-data questions to GPT, and locks private sessions to a local Ollama model",
+	"license": "Apache-2.0",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"router",
+		"privacy",
+		"pii",
+		"ollama",
+		"local-llm"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/atalebagha/pi-privacy-router.git"
+	},
+	"files": [
+		"src",
+		"ollama",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"format": "biome format .",
+		"format:fix": "biome format --write .",
+		"lint": "biome lint .",
+		"typecheck": "tsc --noEmit",
+		"test": "node --test test/*.test.ts",
+		"eval": "node test/eval/run.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": ">=0.99.1",
+		"@earendil-works/pi-coding-agent": ">=0.99.1"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-ai": {
+			"optional": true
+		},
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.15",
+		"@earendil-works/pi-ai": "0.99.1",
+		"@earendil-works/pi-coding-agent": "0.99.1",
+		"@types/node": "^25.9.9",
+		"typescript": "^5.9.3"
+	}
+}

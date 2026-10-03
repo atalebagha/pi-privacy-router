@@ -1,0 +1,44 @@
+{"text":"My blood pressure readings this week were 150/95, help me make a spreadsheet to track them","label":"yes","by":"agent"}
+{"text":"Summarize my therapy notes from Tuesday: I talked about my divorce with Sarah","label":"yes","by":"agent"}
+{"text":"My salary is $185k and I have $42k in my Chase checking, should I max my 401k?","label":"yes","by":"agent"}
+{"text":"Draft a reply to my brother Omar about mom's hospital discharge on Friday","label":"yes","by":"agent"}
+{"text":"My SSN is 123-45-6789, which box on the W-4 does it go in?","label":"yes","by":"agent"}
+{"text":"Help me write to my landlord at 1420 W Elm St Apt 3B about the broken heater","label":"yes","by":"agent"}
+{"text":"I was just diagnosed with type 2 diabetes, help me plan meals for the week","label":"yes","by":"agent"}
+{"text":"My daughter's IEP meeting is next week, here are her test scores: reading 82, math 64","label":"yes","by":"agent"}
+{"text":"Journal: I've been feeling anxious since the layoff and haven't told my wife","label":"yes","by":"agent"}
+{"text":"Our account number is 0049-2231-77 at First National, draft a dispute letter for the $1,240 charge","label":"yes","by":"agent"}
+{"text":"Write a Python script to monitor my room temperature","label":"no","by":"agent"}
+{"text":"Refactor the auth middleware to use async/await","label":"no","by":"agent"}
+{"text":"Explain how JWT refresh tokens work","label":"no","by":"agent"}
+{"text":"Fix this bug: user.email is undefined in signup handler","label":"no","by":"agent"}
+{"text":"What's the weather in Chicago right now?","label":"no","by":"agent"}
+{"text":"Design a schema for storing patient appointments in a clinic app","label":"no","by":"agent"}
+{"text":"Add a salary field to the Employee model and a migration","label":"no","by":"agent"}
+{"text":"Write a privacy policy section about how we store user addresses","label":"no","by":"agent"}
+{"text":"Generate 20 fake user records with names and emails for seeding the dev database","label":"no","by":"agent"}
+{"text":"Explain what HIPAA requires for logging access to medical records","label":"no","by":"agent"}
+{"text":"thanks, that worked","label":"no","by":"agent"}
+{"text":"Who won the Lakers game last night?","label":"no","by":"agent"}
+{"text":"Write a LinkedIn post announcing our seed round","label":"no","by":"agent"}
+{"text":"How do I compute compound interest in Excel?","label":"no","by":"agent"}
+{"text":"Review this PR diff and tell me what could break","label":"no","by":"agent"}
+{"text":"What's the difference between TCP and UDP?","label":"no","by":"agent"}
+{"text":"Help me word a message to my sister Leila about dad's biopsy results coming back Thursday","label":"yes","by":"agent"}
+{"text":"My cofounder and I split equity 60/40 and he doesn't know I'm thinking of leaving, draft talking points for Friday","label":"yes","by":"agent"}
+{"text":"I owe $23,400 on the Amex and $8,100 on the car loan, build me a payoff plan","label":"yes","by":"agent"}
+{"text":"Make this sound less angry: 'Nadia, I'm done covering for you with mom's medication schedule'","label":"yes","by":"agent"}
+{"text":"My passport number is X12345678 and it expires in March, fill in this section of the visa form","label":"yes","by":"agent"}
+{"text":"I've had chest tightness on and off for two weeks, should I worry before my physical on the 14th?","label":"yes","by":"agent"}
+{"text":"Write my wife a note for our anniversary and mention the miscarriage last spring gently","label":"yes","by":"agent"}
+{"text":"My son Yusuf was just diagnosed with ADHD, draft an email to his teacher about accommodations","label":"yes","by":"agent"}
+{"text":"I made $212k on my W-2 plus $38k consulting this year, how much should I set aside for Q4 estimated taxes?","label":"yes","by":"agent"}
+{"text":"Vent: I can't sleep, I keep thinking the company is going to fail and everyone will know it was me","label":"yes","by":"agent"}
+{"text":"Our new address is 88 Linden Ave, Evanston, update the emergency contact form for the kids' school","label":"yes","by":"agent"}
+{"text":"Mom takes 10mg lisinopril and just started metformin, do those interact?","label":"yes","by":"agent"}
+{"text":"Draft a message to Hamza explaining why I can't lend him the $5,000 again","label":"yes","by":"agent"}
+{"text":"My credit score dropped to 640 after two late payments in 2025, help me write dispute letters","label":"yes","by":"agent"}
+{"text":"Help me prepare for my custody mediation next week, the main issue is weekends with the kids","label":"yes","by":"agent"}
+{"text":"Add a dosage field to the Prescription model and validate that it is positive","label":"no","by":"agent"}
+{"text":"Write a SQL query that returns customers whose account balance is below zero","label":"no","by":"agent"}
+{"text":"Explain how credit scores are calculated","label":"no","by":"agent"}
