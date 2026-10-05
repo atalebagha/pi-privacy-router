@@ -1,7 +1,8 @@
 /**
  * pi-privacy-router: registers `privacy-router/auto`, a virtual model that routes each request.
  *
- * - claude lane: coding and planning; gpt lane: live data; general messages stay put.
+ * - Each category (code, live, general) routes to the first usable model of its configured list;
+ *   general messages stay put by default. Usage limits cool a provider down and fail over.
  * - Sensitive sessions lock sticky-local to Ollama, and egress tools are blocked.
  * - `route()` runs before every request, so it is the egress chokepoint: it scans the payload about
  *   to leave the machine, including tool results, before choosing a model.
@@ -28,7 +29,7 @@ import {
 	parseLabel,
 	piiPrompt,
 } from "./classify.ts";
-import { configPath, isLoopbackUrl, laneOfModel, loadConfig, type RouterConfig, splitRef } from "./config.ts";
+import { configPath, isLoopbackUrl, loadConfig, type RouterConfig, splitRef } from "./config.ts";
 import {
 	estimateInputTokens,
 	fileLists,
@@ -39,7 +40,6 @@ import {
 } from "./handoff.ts";
 import { askOneWord, type OllamaOptions, warmUp } from "./ollama.ts";
 import {
-	applyCooldowns,
 	type Decision,
 	decide,
 	isQuotaError,
@@ -48,15 +48,13 @@ import {
 	RouterError,
 	type Signals,
 } from "./policy.ts";
+import { type Availability, fallbackChain, type StoredState, upgradeState } from "./routes.ts";
 import {
 	type BranchEntry,
 	COMMAND_ENTRY,
-	type CloudLane,
 	firstLockIndex,
 	isLocked,
-	type Lane,
 	type RouterCommand,
-	type RouterState,
 	ROUTER_MODEL_ID,
 	ROUTER_PROVIDER,
 	readCommands,
@@ -156,26 +154,37 @@ function usingRouter(ctx: ExtensionContext): boolean {
 	return ctx.model?.provider === ROUTER_PROVIDER && ctx.model.id === ROUTER_MODEL_ID;
 }
 
-function modelFor(ref: string, ctx: ExtensionContext, lane: Lane) {
+function registryModel(ref: string, ctx: ExtensionContext) {
 	const { provider, id } = splitRef(ref);
 	const model = ctx.modelRegistry.find(provider, id);
 	if (!model) throw new RouterError(`Model ${ref} is not in pi's catalog.`);
 	if (!ctx.modelRegistry.hasConfiguredAuth(model)) throw new RouterError(`Model ${ref} has no credentials.`);
-	if (lane === "local" && !isLoopbackUrl(model.baseUrl)) {
-		throw new RouterError(`Local lane model ${ref} is not served from localhost (${model.baseUrl}).`);
+	return model;
+}
+
+function privateModel(config: RouterConfig, ctx: ExtensionContext) {
+	const model = registryModel(config.private, ctx);
+	if (!isLoopbackUrl(model.baseUrl)) {
+		throw new RouterError(`Private model ${config.private} is not served from localhost (${model.baseUrl}).`);
 	}
 	return model;
 }
 
-function disabledLanes(config: RouterConfig, ctx: ExtensionContext): CloudLane[] {
-	return (["claude", "gpt"] as const).filter((lane) => {
-		try {
-			modelFor(config.lanes[lane], ctx, lane);
-			return false;
-		} catch {
-			return true;
-		}
-	});
+/** Spec §4.2: whether pi has the model and credentials for it. */
+function availabilityIn(ctx: ExtensionContext): (ref: string) => Availability {
+	return (ref) => {
+		const { provider, id } = splitRef(ref);
+		const model = ctx.modelRegistry.find(provider, id);
+		if (!model) return "missing";
+		return ctx.modelRegistry.hasConfiguredAuth(model) ? "ok" : "no-credentials";
+	};
+}
+
+/** Configured route models that pi cannot use right now. */
+function unusableModels(config: RouterConfig, ctx: ExtensionContext): string[] {
+	const general = Array.isArray(config.routes.general) ? config.routes.general : [];
+	const availability = availabilityIn(ctx);
+	return [...new Set([...fallbackChain(config), ...general])].filter((ref) => availability(ref) !== "ok");
 }
 
 async function classifyCategory(config: RouterConfig, text: string, signal?: AbortSignal): Promise<Labeled<Category>> {
@@ -194,10 +203,10 @@ async function classifyPii(config: RouterConfig, text: string, signal?: AbortSig
 
 function footerText(decision: Decision): string | undefined {
 	const { target, why } = decision;
-	if (target.kind === "lane" && target.lane === "local") return `🔒 local · ${why.replace(/^lock(ed)?:/, "")}`;
+	if (target.kind === "private") return `🔒 local · ${why.replace(/^lock(ed)?:/, "")}`;
 	if (why.startsWith("pin:")) return `📌 ${why.slice(4)}`;
 	if (why === "classifier down") return "⚠ classifier down";
-	if (target.kind === "lane" || target.kind === "ref") return `→ ${target.lane} · ${why}`;
+	if (target.kind === "model") return `→ ${splitRef(target.ref).id} · ${why}`;
 	return undefined;
 }
 
@@ -224,6 +233,8 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 	let lastDecision = "none";
 	let classifierHealth = "not used yet";
 	let defaultsNoticeShown = false;
+	/** Spec §4.4: each model skipped for missing credentials is announced once per session. */
+	const skipNotices = new Set<string>();
 
 	function restrictTools(config: RouterConfig): void {
 		const active = pi.getActiveTools();
@@ -261,11 +272,18 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			ctx.ui.notify(decision.notice, decision.state?.locked ? "warning" : "info");
 		}
 		lastNotice = decision.notice;
+		const chosen = decision.target.kind === "model" ? decision.target.ref : undefined;
+		for (const skipped of decision.skipped ?? []) {
+			if (chosen === undefined || skipped.reason === "cooling" || skipNotices.has(skipped.ref)) continue;
+			skipNotices.add(skipped.ref);
+			const reason = skipped.reason === "missing" ? "is not in pi's catalog" : "has no credentials";
+			ctx.ui.notify(`${skipped.ref} ${reason}; using ${chosen} for ${decision.why}`, "warning");
+		}
 	}
 
 	function targetModel(
 		decision: Decision,
-		request: ModelRouteRequest<RouterState>,
+		request: ModelRouteRequest<StoredState>,
 		ctx: ExtensionContext,
 		config: RouterConfig,
 	) {
@@ -277,20 +295,20 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			case "failed":
 				if (!request.failed) throw new RouterError("internal: no failed model to retry");
 				return request.failed.model;
-			case "lane":
-				return modelFor(config.lanes[target.lane], ctx, target.lane);
-			case "ref":
-				return modelFor(target.ref, ctx, target.lane);
+			case "private":
+				return privateModel(config, ctx);
+			case "model":
+				return registryModel(target.ref, ctx);
 		}
 	}
 
-	function thinkingFor(decision: Decision, request: ModelRouteRequest<RouterState>) {
+	function thinkingFor(decision: Decision, request: ModelRouteRequest<StoredState>) {
 		if (decision.target.kind === "previous") return request.previous?.thinkingLevel ?? request.thinkingLevel;
 		if (decision.target.kind === "failed") return request.failed?.thinkingLevel ?? request.thinkingLevel;
 		return request.thinkingLevel;
 	}
 
-	pi.registerVirtualModel<RouterState>({
+	pi.registerVirtualModel<StoredState>({
 		provider: ROUTER_PROVIDER,
 		id: ROUTER_MODEL_ID,
 		name: "Auto (router)",
@@ -300,16 +318,17 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			const config = requireConfig();
 			const branch = readBranch(ctx);
 			const commands = branch ? readCommands(branch) : { lockRequested: false, pin: undefined, cooldowns: {} };
-			const state = applyCooldowns(
+			const state = upgradeState(
 				request.state ?? (branch ? readRouterState(branch) : undefined),
 				commands.cooldowns,
-				config.defaultLane,
+				config,
 			);
 			const delta = deltaText(request.messages);
 			const policy = pathPolicy(config, ctx.cwd);
 			const secretInUser = findSecret(delta.user);
 			const secretInTool = secretInUser ? undefined : findSecret(delta.tool);
-			const pin = commands.pin === undefined ? undefined : config.pinTargets[commands.pin];
+			// A pin whose name left the config is ignored.
+			const pin = commands.pin === undefined ? undefined : config.pins[commands.pin];
 
 			const signals: Signals = {
 				reason: request.reason,
@@ -325,16 +344,10 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 						: undefined,
 				pinName: pin ? commands.pin : undefined,
 				pin,
-				hasPrevious: request.previous !== undefined,
-				previousLane: request.previous
-					? laneOfModel(request.previous.model.provider, request.previous.model.id, config)
-					: undefined,
-				hasFailed: request.failed !== undefined,
-				failedLane: request.failed
-					? laneOfModel(request.failed.model.provider, request.failed.model.id, config)
-					: undefined,
+				previous: request.previous ? `${request.previous.model.provider}/${request.previous.model.id}` : undefined,
+				failed: request.failed ? `${request.failed.model.provider}/${request.failed.model.id}` : undefined,
 				failedIsQuota: request.failed ? isQuotaError(request.failed.message.errorMessage ?? "") : false,
-				disabled: disabledLanes(config, ctx),
+				availability: availabilityIn(ctx),
 				now: startedAt,
 			};
 
@@ -346,7 +359,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 				} else {
 					const [pii, category] = await Promise.allSettled([
 						classifyPii(config, delta.user, request.signal),
-						// A bare "ok, continue" carries no new task: keep the lane (the privacy check still runs).
+						// A bare "ok, continue" carries no new task: keep the current model (the privacy check still runs).
 						isAcknowledgement(delta.user)
 							? Promise.resolve<Labeled<Category>>({ label: "general", p: 1 })
 							: classifyCategory(config, delta.user, request.signal),
@@ -389,10 +402,10 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			ctx.ui.notify(`privacy-router: ${configPath()} not found; using built-in defaults`, "info");
 			defaultsNoticeShown = true;
 		}
-		const disabled = disabledLanes(config, ctx);
-		if (disabled.length > 0 && ctx.hasUI) {
+		const unusable = unusableModels(config, ctx);
+		if (unusable.length > 0 && ctx.hasUI) {
 			ctx.ui.notify(
-				`privacy-router: lane ${disabled.join(", ")} unavailable (model missing or no credentials)`,
+				`privacy-router: ${unusable.join(", ")} unavailable (not in pi or no credentials); routing skips them`,
 				"warning",
 			);
 		}
@@ -425,7 +438,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		if (!isLocked(event.branchEntries)) return undefined;
 		const loaded = loadConfig();
 		if (!loaded.ok) return undefined;
-		const localRef = splitRef(loaded.config.lanes.local);
+		const localRef = splitRef(loaded.config.private);
 		const local = ctx.modelRegistry.find(localRef.provider, localRef.id);
 		if (!local) return undefined;
 		const { preparation } = event;
@@ -498,7 +511,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 
 	pi.on("agent_before_settle", async (event, ctx) => {
 		// pi does not retry a usage limit it classifies as permanent (Anthropic's 400 "out of extra
-		// usage"), so the turn would just end. Cool the lane down and retry the turn on the other one.
+		// usage"), so the turn would just end. Cool the provider down and retry the turn on the next usable model.
 		if (event.outcome !== "error" || !usingRouter(ctx)) return undefined;
 		const branch = readBranch(ctx);
 		if (branch === undefined || isLocked(branch)) return undefined;
@@ -507,16 +520,19 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		);
 		const message = failed?.message;
 		if (!failed || message?.role !== "assistant" || message.stopReason !== "error") return undefined;
+		// A routing refusal comes from the router itself, not from a provider's usage limit.
+		if (message.provider === ROUTER_PROVIDER) return undefined;
+		const failedModel = ctx.modelRegistry.find(message.provider, message.model);
+		if (failedModel && isLoopbackUrl(failedModel.baseUrl)) return undefined;
 		const loaded = loadConfig();
 		if (!loaded.ok) return undefined;
 		const config = loaded.config;
-		const lane = laneOfModel(message.provider, message.model, config);
-		if (lane === undefined) return undefined;
 		const failover = planQuotaFailover(
 			{
-				state: applyCooldowns(readRouterState(branch), readCommands(branch).cooldowns, config.defaultLane),
-				failure: { lane, message: message.errorMessage ?? "" },
-				disabled: disabledLanes(config, ctx),
+				state: upgradeState(readRouterState(branch), readCommands(branch).cooldowns, config),
+				failed: `${message.provider}/${message.model}`,
+				message: message.errorMessage ?? "",
+				availability: availabilityIn(ctx),
 				now: Date.now(),
 			},
 			config,
@@ -524,11 +540,11 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		if (!failover) return undefined;
 		if (ctx.hasUI) {
 			ctx.ui.notify(
-				`${failover.from} usage limit reached; retrying on ${failover.to} for ${config.quotaCooldownMinutes} min`,
+				`${failover.provider} usage limit reached; retrying on ${failover.to} for ${config.quotaCooldownMinutes} min`,
 				"warning",
 			);
 		}
-		const cooldown: RouterCommand = { kind: "cooldown", lane: failover.from, until: failover.until };
+		const cooldown: RouterCommand = { kind: "cooldown", provider: failover.provider, until: failover.until };
 		return {
 			entries: [
 				{ type: "custom", customType: COMMAND_ENTRY, data: cooldown },
@@ -570,7 +586,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		const branch = readBranch(ctx);
 		if (branch !== undefined && !isLocked(branch)) return;
 		const loaded = loadConfig();
-		const localRef = loaded.ok ? loaded.config.lanes.local : undefined;
+		const localRef = loaded.ok ? loaded.config.private : undefined;
 		// Any model served from this machine keeps the session private, not just the configured worker.
 		if (isLoopbackUrl(event.model.baseUrl)) return;
 		const fallback =
@@ -649,10 +665,10 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 	});
 
 	pi.registerCommand("route", {
-		description: "Pin a cloud model (/route <target>) or resume automatic routing (/route auto)",
+		description: "Pin a model by name from pins (/route <name>) or resume automatic routing (/route auto)",
 		getArgumentCompletions: (prefix) => {
 			const loaded = loadConfig();
-			const names = loaded.ok ? [...Object.keys(loaded.config.pinTargets), "auto"] : ["auto"];
+			const names = loaded.ok ? [...Object.keys(loaded.config.pins), "auto"] : ["auto"];
 			return names.filter((name) => name.startsWith(prefix)).map((name) => ({ value: name, label: name }));
 		},
 		handler: async (args, ctx) => {
@@ -673,8 +689,8 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 				ctx.ui.notify("Routing is automatic again.", "info");
 				return;
 			}
-			if (!(name in loaded.config.pinTargets)) {
-				const names = [...Object.keys(loaded.config.pinTargets), "auto"].join(", ");
+			if (!(name in loaded.config.pins)) {
+				const names = [...Object.keys(loaded.config.pins), "auto"].join(", ");
 				ctx.ui.notify(`Usage: /route <${names}>`, "warning");
 				return;
 			}
@@ -688,17 +704,25 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		description: "Show router status",
 		handler: async (_args, ctx) => {
 			const branch = readBranch(ctx) ?? [];
-			const state = readRouterState(branch);
 			const commands = readCommands(branch);
 			const loaded = loadConfig();
+			const state = loaded.ok ? upgradeState(readRouterState(branch), commands.cooldowns, loaded.config) : undefined;
+			// The lock shows even when the config is invalid; the reason comes from the stored state.
+			const stored = readRouterState(branch);
 			let lock = "";
-			if (state?.locked) lock = ` · 🔒 locked (${state.lockReason}: ${state.lockDetail})`;
-			else if (commands.lockRequested) lock = " · 🔒 lock requested";
+			if (isLocked(branch)) {
+				lock = stored?.locked ? ` · 🔒 locked (${stored.lockReason}: ${stored.lockDetail})` : " · 🔒 locked";
+			}
+			const now = Date.now();
+			const cooling = Object.entries(state?.cooldowns ?? {})
+				.filter(([, until]) => Date.parse(until) > now)
+				.map(([provider, until]) => `${provider} until ${new Date(until).toLocaleTimeString()}`);
 			ctx.ui.notify(
 				[
 					`selected: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"}`,
-					`lane: ${state?.lane ?? "(none yet)"}${lock}`,
+					`model: ${state?.model ?? "(none yet)"} · route: ${state?.route ?? "-"}${lock}`,
 					`pin: ${commands.pin ?? "none"}`,
+					`cooldowns: ${cooling.length > 0 ? cooling.join(", ") : "none"}`,
 					`config: ${loaded.ok ? `${loaded.source} (${configPath()})` : `INVALID: ${loaded.error}`}`,
 					`classifier: ${classifierHealth}`,
 					`last decision: ${lastDecision}`,

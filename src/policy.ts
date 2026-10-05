@@ -1,13 +1,27 @@
 /**
  * The routing brain. Pure: `decide()` maps signals gathered by index.ts to a target and new state.
  *
- * Privacy-path failures end in an error or the local lane, never a silent cloud route.
- * Category-path failures mean "stay on the current lane".
+ * Privacy-path failures end in an error or the private model, never a silent cloud route.
+ * Category-path failures mean "stay on the current model". Spec §4.3.
  */
 
 import type { Category } from "./classify.ts";
-import type { PinTarget, RouterConfig } from "./config.ts";
-import type { CloudLane, Lane, LockReason, RouterState } from "./state.ts";
+import type { RouterConfig } from "./config.ts";
+import {
+	type Availability,
+	coolingUntil,
+	describeSkipped,
+	fallbackChain,
+	firstUsable,
+	type ModelRef,
+	providerOf,
+	type Route,
+	type RoutedState,
+	routeList,
+	type Skipped,
+	type Usability,
+} from "./routes.ts";
+import type { LockReason } from "./state.ts";
 
 export class RouterError extends Error {
 	constructor(message: string) {
@@ -18,11 +32,7 @@ export class RouterError extends Error {
 
 export type Reason = "user" | "continuation" | "retry" | "direct";
 
-export type Target =
-	| { kind: "lane"; lane: Lane }
-	| { kind: "ref"; ref: string; lane: CloudLane }
-	| { kind: "previous" }
-	| { kind: "failed" };
+export type Target = { kind: "private" } | { kind: "model"; ref: ModelRef } | { kind: "previous" } | { kind: "failed" };
 
 export interface Signals {
 	reason: Reason;
@@ -34,116 +44,49 @@ export interface Signals {
 	pathMention?: string;
 	/** e.g. "github-token in tool result". */
 	secret?: string;
+	/** Active pin and the model it pins (config `pins`). */
 	pinName?: string;
-	pin?: PinTarget;
+	pin?: ModelRef;
 	/** Set by index.ts only when `needsClassification()` is true. */
 	pii?: "yes" | "no" | "error";
 	category?: { label: Category; p: number } | "error";
-	hasPrevious: boolean;
-	previousLane?: Lane;
-	hasFailed: boolean;
-	failedLane?: Lane;
+	/** Model of the latest successful reply (`request.previous`). */
+	previous?: ModelRef;
+	/** Model whose reply failed (`request.failed`). */
+	failed?: ModelRef;
 	failedIsQuota: boolean;
-	/** Cloud lanes whose model is missing from the catalog or lacks credentials. */
-	disabled: readonly CloudLane[];
+	/** pi's registry: whether a model exists and has credentials. */
+	availability: (ref: ModelRef) => Availability;
 	now: number;
 }
 
 export interface Decision {
 	target: Target;
 	/** New state to store; undefined keeps the current state. */
-	state?: RouterState;
+	state?: RoutedState;
 	notice?: string;
-	/** Short label for the footer and /router, e.g. "code", "lock:secret", "pin:claude-max". */
+	/** Short label for the footer and /privacy, e.g. "code", "lock:secret", "pin:claude-max". */
 	why: string;
+	/** Models passed over to reach the target; index.ts announces missing ones once per session. */
+	skipped?: Skipped[];
 }
 
 export type PolicyConfig = Pick<
 	RouterConfig,
-	"defaultLane" | "minProb" | "quotaCooldownMinutes" | "onPrivacyCheckFailure" | "ollama"
+	"routes" | "defaultModel" | "minProb" | "quotaCooldownMinutes" | "onPrivacyCheckFailure" | "ollama"
 >;
 
-export interface LaneChoiceInput {
-	/** Lane this session is on; undefined before any router state exists. */
-	current: CloudLane | undefined;
-	/** Lane of the model that answered last, when it maps to a cloud lane. */
-	previous: CloudLane | undefined;
-	category: Category;
-	p: number;
-	/** Disabled lanes and lanes in quota cooldown. */
-	unavailable: ReadonlySet<CloudLane>;
-}
-
 /**
- * Hysteresis: only a confident `code` or `live` label moves the session, and only to an available
- * lane. Spec §5.1.
- */
-export function chooseLane(input: LaneChoiceInput, config: Pick<RouterConfig, "defaultLane" | "minProb">): CloudLane {
-	const start = input.current ?? input.previous ?? config.defaultLane;
-	if (input.category === "general" || input.p < config.minProb) return start;
-	const target: CloudLane = input.category === "code" ? "claude" : "gpt";
-	return input.unavailable.has(target) ? start : target;
-}
-
-/**
- * Plan usage exhausted ("usage limit reached", "quota exceeded"). Transient throttling (a bare 429,
- * a per-minute rate limit, "overloaded") is retried by pi and must not switch lanes for an hour.
+ * Plan usage exhausted ("usage limit reached", "quota exceeded", "out of extra usage"). Transient
+ * throttling (a bare 429, a per-minute rate limit, "overloaded") is retried by pi and must not cool a
+ * provider down for an hour.
  */
 export function isQuotaError(message: string): boolean {
 	return /usage limit|quota|out of extra usage/i.test(message) && !/overloaded/i.test(message);
 }
 
-function otherLane(lane: CloudLane): CloudLane {
-	return lane === "claude" ? "gpt" : "claude";
-}
-
-export interface QuotaFailoverInput {
-	state: RouterState | undefined;
-	/** Lane of the model whose reply failed, and its error message. */
-	failure: { lane: Lane; message: string };
-	disabled: readonly CloudLane[];
-	now: number;
-}
-
-/**
- * pi retries only transient errors, so a usage limit it does not retry (Anthropic's 400 "out of
- * extra usage") ends the turn. The settle hook uses this to cool the lane down and retry the turn on
- * the other lane. Undefined when that lane is disabled or cooling down too: no bouncing.
- */
-export function planQuotaFailover(
-	input: QuotaFailoverInput,
-	config: Pick<RouterConfig, "quotaCooldownMinutes">,
-): { from: CloudLane; to: CloudLane; until: string } | undefined {
-	const { lane } = input.failure;
-	if (!isCloud(lane) || !isQuotaError(input.failure.message)) return undefined;
-	const to = otherLane(lane);
-	if (input.disabled.includes(to) || inCooldown(input.state, to, input.now)) return undefined;
-	return { from: lane, to, until: new Date(input.now + config.quotaCooldownMinutes * 60_000).toISOString() };
-}
-
-/** Cooldowns written as commands join the stored state; the later end time wins. */
-export function applyCooldowns(
-	state: RouterState | undefined,
-	cooldowns: Partial<Record<CloudLane, string>>,
-	defaultLane: CloudLane,
-): RouterState | undefined {
-	const lanes = Object.keys(cooldowns) as CloudLane[];
-	if (lanes.length === 0) return state;
-	const merged = { ...state?.cooldowns };
-	for (const lane of lanes) {
-		const until = cooldowns[lane] as string;
-		const stored = merged[lane];
-		if (stored === undefined || Date.parse(until) > Date.parse(stored)) merged[lane] = until;
-	}
-	return { ...(state ?? { lane: defaultLane, locked: false }), cooldowns: merged };
-}
-
-function isCloud(lane: Lane | undefined): lane is CloudLane {
-	return lane === "claude" || lane === "gpt";
-}
-
 /** True when a user request still needs the two classifier calls. */
-export function needsClassification(state: RouterState | undefined, signals: Signals): boolean {
+export function needsClassification(state: RoutedState | undefined, signals: Signals): boolean {
 	return (
 		signals.reason === "user" &&
 		signals.branchReadable &&
@@ -165,57 +108,55 @@ function deterministicLock(signals: Signals): { reason: LockReason; detail: stri
 	return undefined;
 }
 
-function lockNow(state: RouterState | undefined, reason: LockReason, detail: string): Decision {
+function lockNow(state: RoutedState | undefined, reason: LockReason, detail: string): Decision {
 	return {
-		target: { kind: "lane", lane: "local" },
-		state: { ...state, lane: "local", locked: true, lockReason: reason, lockDetail: detail },
-		// Spec §7.1: the 35b may need to load from disk, so warn that the first local reply can be slow.
+		target: { kind: "private" },
+		state: { ...state, locked: true, lockReason: reason, lockDetail: detail, lane: "local" },
+		// The local model may need to load from disk, so warn that the first local reply can be slow.
 		notice: `🔒 locked · ${reason} · ${detail} · loading local model, first reply may be slow`,
 		why: `lock:${reason}`,
 	};
 }
 
-/** New state only when the lane changes. */
-function withLane(state: RouterState | undefined, lane: CloudLane): RouterState | undefined {
-	return state?.lane === lane ? undefined : { ...state, lane, locked: false };
+function usabilityOf(state: RoutedState | undefined, signals: Signals): Usability {
+	return { availability: signals.availability, cooldowns: state?.cooldowns, now: signals.now };
 }
 
-function inCooldown(state: RouterState | undefined, lane: CloudLane, now: number): boolean {
-	const until = state?.cooldowns?.[lane];
-	return until !== undefined && Date.parse(until) > now;
+/** New state only when the model or route changes. */
+function withModel(state: RoutedState | undefined, model: ModelRef, route: Route): RoutedState | undefined {
+	if (state?.model === model && state.route === route) return undefined;
+	return { ...state, model, route, locked: false };
 }
 
-function unavailableLanes(state: RouterState | undefined, signals: Signals): Set<CloudLane> {
-	const unavailable = new Set<CloudLane>(signals.disabled);
-	for (const lane of ["claude", "gpt"] as const) if (inCooldown(state, lane, signals.now)) unavailable.add(lane);
-	return unavailable;
+function noUsable(what: string, skipped: readonly Skipped[]): RouterError {
+	return new RouterError(
+		`No usable model for ${what}: ${describeSkipped(skipped)}. Log in to a provider, wait for the cooldown, or edit routes in privacy-router.json.`,
+	);
 }
 
-function startLane(state: RouterState | undefined, signals: Signals, config: PolicyConfig): CloudLane {
-	const current = isCloud(state?.lane) ? state.lane : undefined;
-	const previous = isCloud(signals.previousLane) ? signals.previousLane : undefined;
-	const start = current ?? previous ?? config.defaultLane;
-	// A lane cooling down after a usage limit cannot be stayed on. A disabled lane is not swapped
-	// here: routing to it stays an error, so missing credentials are never hidden.
-	const other = otherLane(start);
-	const otherUsable = !signals.disabled.includes(other) && !inCooldown(state, other, signals.now);
-	return inCooldown(state, start, signals.now) && otherUsable ? other : start;
+function currentModel(state: RoutedState | undefined, signals: Signals, config: PolicyConfig): ModelRef {
+	return state?.model ?? signals.previous ?? config.defaultModel;
 }
 
-/** A continuation cannot stay on a model whose lane hit its usage limit mid-turn. */
-function leaveCooledPrevious(state: RouterState | undefined, signals: Signals, why: string): Decision | undefined {
-	const lane = signals.previousLane;
-	if (!isCloud(lane) || !inCooldown(state, lane, signals.now)) return undefined;
-	const to = otherLane(lane);
-	if (signals.disabled.includes(to) || inCooldown(state, to, signals.now)) return undefined;
-	return { target: { kind: "lane", lane: to }, state: withLane(state, to), why: `${why} (${lane} cooling down)` };
+/** Spec §4.3 rule 3: stay on the current model if usable, else the first usable model of the fallback chain. */
+function stayOrFallback(state: RoutedState | undefined, signals: Signals, config: PolicyConfig, why: string): Decision {
+	const usability = usabilityOf(state, signals);
+	const current = currentModel(state, signals, config);
+	if (firstUsable([current], usability).ref !== undefined) {
+		const route: Route = state?.model === current ? (state.route ?? "default") : "default";
+		return { target: { kind: "model", ref: current }, state: withModel(state, current, route), why };
+	}
+	const picked = firstUsable(fallbackChain(config), usability);
+	if (picked.ref === undefined) throw noUsable(why, picked.skipped);
+	return {
+		target: { kind: "model", ref: picked.ref },
+		state: withModel(state, picked.ref, "default"),
+		why,
+		skipped: picked.skipped,
+	};
 }
 
-function stay(state: RouterState | undefined, signals: Signals, config: PolicyConfig, why: string): Decision {
-	return { target: { kind: "lane", lane: startLane(state, signals, config) }, why };
-}
-
-function decideUser(state: RouterState | undefined, signals: Signals, config: PolicyConfig): Decision {
+function decideUser(state: RoutedState | undefined, signals: Signals, config: PolicyConfig): Decision {
 	if (signals.pii === "yes") return lockNow(state, "pii", "personal information in message");
 	let notice: string | undefined;
 	if (signals.pii !== "no") {
@@ -227,81 +168,140 @@ function decideUser(state: RouterState | undefined, signals: Signals, config: Po
 		notice = "⚠ privacy check unavailable; deterministic checks only";
 	}
 
-	if (signals.pin && signals.pinName) {
-		if (!inCooldown(state, signals.pin.lane, signals.now)) {
-			const target: Target = signals.pin.model
-				? { kind: "ref", ref: signals.pin.model, lane: signals.pin.lane }
-				: { kind: "lane", lane: signals.pin.lane };
-			return { target, state: withLane(state, signals.pin.lane), notice, why: `pin:${signals.pinName}` };
+	if (signals.pin !== undefined && signals.pinName !== undefined) {
+		const availability = signals.availability(signals.pin);
+		if (availability !== "ok") {
+			const reason = availability === "missing" ? "is not in pi's catalog" : "has no credentials";
+			throw new RouterError(`Pinned model ${signals.pin} ${reason}. Log in, or run /route auto.`);
 		}
-		// The pinned lane hit its usage limit: route normally until the cooldown ends, then the pin resumes.
-		const paused = `📌 ${signals.pinName} paused: ${signals.pin.lane} is cooling down after a usage limit`;
+		const provider = providerOf(signals.pin);
+		if (coolingUntil(state?.cooldowns, provider, signals.now) === undefined) {
+			return {
+				target: { kind: "model", ref: signals.pin },
+				state: withModel(state, signals.pin, "pin"),
+				notice,
+				why: `pin:${signals.pinName}`,
+			};
+		}
+		// The pinned provider hit its usage limit: route normally until the cooldown ends, then the pin resumes.
+		const paused = `📌 ${signals.pinName} paused: ${provider} is cooling down after a usage limit`;
 		notice = notice ? `${notice}; ${paused}` : paused;
 	}
 
-	let lane: CloudLane;
-	let why: string;
-	if (signals.category === undefined || signals.category === "error") {
-		lane = startLane(state, signals, config);
-		notice = notice ?? "⚠ classifier down; staying on current lane";
-		why = "classifier down";
-	} else {
-		lane = chooseLane(
-			{
-				current: startLane(state, signals, config),
-				previous: undefined,
-				category: signals.category.label,
-				p: signals.category.p,
-				unavailable: unavailableLanes(state, signals),
-			},
-			config,
-		);
-		why = signals.category.label;
+	const category = signals.category;
+	if (category === undefined || category === "error") {
+		const stayed = stayOrFallback(state, signals, config, "classifier down");
+		return { ...stayed, notice: notice ?? "⚠ classifier down; staying on the current model" };
 	}
-	if (signals.disabled.includes(lane)) {
-		throw new RouterError(
-			`Lane "${lane}" is unavailable: its model is missing from pi's catalog or has no credentials. Log in to its provider, or set "lanes.${lane}" in privacy-router.json to a model you have.`,
-		);
+	const confident = category.p >= config.minProb;
+	let list: ModelRef[] | undefined;
+	if (confident && (category.label === "code" || category.label === "live")) list = config.routes[category.label];
+	else if (confident && category.label === "general" && Array.isArray(config.routes.general)) {
+		list = config.routes.general;
 	}
-	return { target: { kind: "lane", lane }, state: withLane(state, lane), notice, why };
+	if (list === undefined) return { ...stayOrFallback(state, signals, config, category.label), notice };
+	const picked = firstUsable(list, usabilityOf(state, signals));
+	if (picked.ref === undefined) throw noUsable(category.label, picked.skipped);
+	return {
+		target: { kind: "model", ref: picked.ref },
+		state: withModel(state, picked.ref, category.label),
+		notice,
+		why: category.label,
+		skipped: picked.skipped,
+	};
 }
 
-function decideRetry(state: RouterState | undefined, signals: Signals, config: PolicyConfig): Decision {
-	if (!signals.hasFailed) {
-		return signals.hasPrevious ? { target: { kind: "previous" }, why: "retry" } : stay(state, signals, config, "retry");
+function decideMidTurn(
+	state: RoutedState | undefined,
+	signals: Signals,
+	config: PolicyConfig,
+	reason: "continuation" | "direct",
+): Decision {
+	if (signals.previous === undefined) return stayOrFallback(state, signals, config, reason);
+	const provider = providerOf(signals.previous);
+	if (coolingUntil(state?.cooldowns, provider, signals.now) === undefined) {
+		return { target: { kind: "previous" }, why: reason };
 	}
-	const failed = signals.failedLane;
-	if (signals.failedIsQuota && isCloud(failed)) {
-		const other: CloudLane = failed === "claude" ? "gpt" : "claude";
-		if (signals.disabled.includes(other)) return { target: { kind: "failed" }, why: "retry (no failover lane)" };
-		const until = new Date(signals.now + config.quotaCooldownMinutes * 60_000).toISOString();
-		return {
-			target: { kind: "lane", lane: other },
-			state: { ...state, lane: other, locked: false, cooldowns: { ...state?.cooldowns, [failed]: until } },
-			notice: `${failed} usage limit reached; using ${other} for ${config.quotaCooldownMinutes} min`,
-			why: `failover:${failed}→${other}`,
-		};
-	}
-	return { target: { kind: "failed" }, why: "retry" };
+	const picked = firstUsable(routeList(state?.route, config), usabilityOf(state, signals));
+	if (picked.ref === undefined) throw noUsable(reason, picked.skipped);
+	return {
+		target: { kind: "model", ref: picked.ref },
+		state: withModel(state, picked.ref, state?.route ?? "default"),
+		why: `${reason} (${provider} cooling down)`,
+		skipped: picked.skipped,
+	};
 }
 
-export function decide(state: RouterState | undefined, signals: Signals, config: PolicyConfig): Decision {
-	if (!signals.branchReadable) return { target: { kind: "lane", lane: "local" }, why: "branch unreadable" };
-	if (state?.locked) return { target: { kind: "lane", lane: "local" }, why: `locked:${state.lockReason ?? "unknown"}` };
+function decideRetry(state: RoutedState | undefined, signals: Signals, config: PolicyConfig): Decision {
+	if (signals.failed === undefined) {
+		return signals.previous !== undefined
+			? { target: { kind: "previous" }, why: "retry" }
+			: stayOrFallback(state, signals, config, "retry");
+	}
+	if (!signals.failedIsQuota) return { target: { kind: "failed" }, why: "retry" };
+	const provider = providerOf(signals.failed);
+	const until = new Date(signals.now + config.quotaCooldownMinutes * 60_000).toISOString();
+	const cooled: RoutedState = {
+		...(state ?? { locked: false }),
+		cooldowns: { ...state?.cooldowns, [provider]: until },
+	};
+	const picked = firstUsable(routeList(state?.route, config), usabilityOf(cooled, signals));
+	// A zero cooldown leaves the failed provider usable; failing over to it would loop forever.
+	if (picked.ref === undefined || providerOf(picked.ref) === provider) {
+		return { target: { kind: "failed" }, why: "retry (no failover model)" };
+	}
+	return {
+		target: { kind: "model", ref: picked.ref },
+		state: { ...cooled, model: picked.ref, route: state?.route ?? "default", locked: false },
+		notice: `${provider} usage limit reached; using ${picked.ref} for ${config.quotaCooldownMinutes} min`,
+		why: `failover:${provider}→${picked.ref}`,
+		skipped: picked.skipped,
+	};
+}
+
+export interface QuotaFailoverInput {
+	state: RoutedState | undefined;
+	/** Model whose reply ended the turn with an error. */
+	failed: ModelRef;
+	/** Its error message. */
+	message: string;
+	availability: (ref: ModelRef) => Availability;
+	now: number;
+}
+
+/**
+ * Spec §4.5: pi retries only transient errors, so a usage limit it does not retry ends the turn. The
+ * settle hook cools the provider down and retries the turn, but only when a usable model remains.
+ */
+export function planQuotaFailover(
+	input: QuotaFailoverInput,
+	config: Pick<RouterConfig, "routes" | "defaultModel" | "quotaCooldownMinutes">,
+): { provider: string; until: string; to: ModelRef } | undefined {
+	if (!isQuotaError(input.message)) return undefined;
+	const provider = providerOf(input.failed);
+	const until = new Date(input.now + config.quotaCooldownMinutes * 60_000).toISOString();
+	const picked = firstUsable(routeList(input.state?.route, config), {
+		availability: input.availability,
+		cooldowns: { ...input.state?.cooldowns, [provider]: until },
+		now: input.now,
+	});
+	// A zero cooldown leaves the failed provider usable; retrying on it would loop forever.
+	if (picked.ref === undefined || providerOf(picked.ref) === provider) return undefined;
+	return { provider, until, to: picked.ref };
+}
+
+export function decide(state: RoutedState | undefined, signals: Signals, config: PolicyConfig): Decision {
+	if (!signals.branchReadable) return { target: { kind: "private" }, why: "branch unreadable" };
+	if (state?.locked) return { target: { kind: "private" }, why: `locked:${state.lockReason ?? "unknown"}` };
 	const lock = deterministicLock(signals);
 	if (lock) return lockNow(state, lock.reason, lock.detail);
 	switch (signals.reason) {
 		case "user":
 			return decideUser(state, signals, config);
 		case "continuation":
-			if (!signals.hasPrevious) return stay(state, signals, config, "continuation");
-			return (
-				leaveCooledPrevious(state, signals, "continuation") ?? { target: { kind: "previous" }, why: "continuation" }
-			);
+		case "direct":
+			return decideMidTurn(state, signals, config, signals.reason);
 		case "retry":
 			return decideRetry(state, signals, config);
-		case "direct":
-			if (!signals.hasPrevious) return stay(state, signals, config, "direct");
-			return leaveCooledPrevious(state, signals, "direct") ?? { target: { kind: "previous" }, why: "direct" };
 	}
 }

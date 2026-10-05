@@ -1,8 +1,8 @@
 {
 	"name": "pi-privacy-router",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"type": "module",
-	"description": "Privacy-aware model router for the pi coding agent: a local classifier sends coding to Claude and live-data questions to GPT, and locks private sessions to a local Ollama model",
+	"description": "Privacy-aware model router for the pi coding agent: a local classifier routes each message to your configured models, fails over on usage limits, and locks private sessions to a local Ollama model",
 	"license": "Apache-2.0",
 	"keywords": [
 		"pi-package",

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
-	chooseLane,
 	decide,
 	isQuotaError,
 	needsClassification,
@@ -10,22 +9,30 @@ import {
 	RouterError,
 	type Signals,
 } from "../src/policy.ts";
-import type { RouterState } from "../src/state.ts";
+import type { Availability, RoutedState } from "../src/routes.ts";
 
 const NOW = Date.parse("2026-10-02T12:00:00Z");
+const SOON = new Date(NOW + 30 * 60_000).toISOString();
+const HOUR = new Date(NOW + 60 * 60_000).toISOString();
+const SONNET = "anthropic/claude-sonnet-5";
+const OPUS = "anthropic/claude-opus-5";
+const GPT = "openai-codex/gpt-6-sol";
+const GEMINI = "google/gemini-3-pro";
 const config = DEFAULT_CONFIG;
+const threeProviders = {
+	...DEFAULT_CONFIG,
+	routes: { code: [SONNET, GEMINI, GPT], live: [GPT, GEMINI], general: "stay" as const },
+};
 
-function signals(overrides: Partial<Signals> = {}): Signals {
+function signals(overrides: Partial<Signals> = {}, unavailable: Record<string, Availability> = {}): Signals {
 	return {
 		reason: "user",
 		branchReadable: true,
 		lockRequested: false,
 		cwdSensitive: false,
 		privateTag: false,
-		hasPrevious: false,
-		hasFailed: false,
 		failedIsQuota: false,
-		disabled: [],
+		availability: (ref) => unavailable[ref] ?? "ok",
 		now: NOW,
 		pii: "no",
 		category: { label: "general", p: 1 },
@@ -33,13 +40,15 @@ function signals(overrides: Partial<Signals> = {}): Signals {
 	};
 }
 
-const onClaude: RouterState = { lane: "claude", locked: false };
-const locked: RouterState = { lane: "local", locked: true, lockReason: "pii", lockDetail: "x" };
+const onSonnet: RoutedState = { model: SONNET, route: "code", locked: false };
+const onGpt: RoutedState = { model: GPT, route: "live", locked: false };
+const locked: RoutedState = { locked: true, lockReason: "pii", lockDetail: "x", lane: "local" };
+const model = (ref: string) => ({ kind: "model", ref });
 
-test("a locked state routes local for every reason, and a pin cannot override it", () => {
+test("a locked state routes to the private model for every reason, and a pin cannot override it", () => {
 	for (const reason of ["user", "continuation", "retry", "direct"] as const) {
-		const d = decide(locked, signals({ reason, hasPrevious: true, pin: { lane: "gpt" }, pinName: "gpt" }), config);
-		assert.deepEqual(d.target, { kind: "lane", lane: "local" }, reason);
+		const d = decide(locked, signals({ reason, previous: SONNET, pin: GPT, pinName: "gpt" }), config);
+		assert.deepEqual(d.target, { kind: "private" }, reason);
 		assert.equal(d.state, undefined, reason);
 	}
 });
@@ -50,159 +59,216 @@ test("deterministic locks, in precedence order", () => {
 		[{ cwdSensitive: true }, "cwd"],
 		[{ privateTag: true }, "tag"],
 		[{ pathMention: "~/private-docs/w2.pdf" }, "path"],
-		[{ secret: "github-token in tool result", reason: "continuation", hasPrevious: true }, "secret"],
+		[{ secret: "github-token in tool result", reason: "continuation", previous: SONNET }, "secret"],
 	];
 	for (const [overrides, reason] of cases) {
-		const d = decide(onClaude, signals(overrides), config);
-		assert.deepEqual(d.target, { kind: "lane", lane: "local" });
+		const d = decide(onSonnet, signals(overrides), config);
+		assert.deepEqual(d.target, { kind: "private" });
 		assert.equal(d.state?.locked, true);
 		assert.equal(d.state?.lockReason, reason);
 	}
 });
 
+test("a lock decision's state passes 0.1's state check, so a downgrade keeps the lock", () => {
+	const state = decide(onSonnet, signals({ privateTag: true }), config).state;
+	// 0.1's isRouterState: typeof lane === "string" && typeof locked === "boolean".
+	assert.equal(typeof state?.lane === "string" && typeof state.locked === "boolean", true);
+	assert.equal(state?.lane, "local");
+});
+
 test("a secret in a tool result locks a continuation (egress backstop)", () => {
 	const d = decide(
-		onClaude,
-		signals({ reason: "continuation", hasPrevious: true, secret: "jwt in tool result" }),
+		onSonnet,
+		signals({ reason: "continuation", previous: SONNET, secret: "jwt in tool result" }),
 		config,
 	);
-	assert.deepEqual(d.target, { kind: "lane", lane: "local" });
+	assert.deepEqual(d.target, { kind: "private" });
 	assert.equal(d.state?.lockDetail, "jwt in tool result");
 });
 
 test("PII yes locks at any probability", () => {
-	const d = decide(onClaude, signals({ pii: "yes", category: { label: "code", p: 0.01 } }), config);
+	const d = decide(onSonnet, signals({ pii: "yes", category: { label: "code", p: 0.01 } }), config);
 	assert.equal(d.state?.lockReason, "pii");
 });
 
 test("PII check failure: block throws, warn proceeds with a notice", () => {
-	assert.throws(() => decide(onClaude, signals({ pii: "error" }), config), RouterError);
-	const d = decide(onClaude, signals({ pii: "error" }), { ...config, onPrivacyCheckFailure: "warn" });
-	assert.deepEqual(d.target, { kind: "lane", lane: "claude" });
+	assert.throws(() => decide(onSonnet, signals({ pii: "error" }), config), RouterError);
+	const d = decide(onSonnet, signals({ pii: "error" }), { ...config, onPrivacyCheckFailure: "warn" });
+	assert.deepEqual(d.target, model(SONNET));
 	assert.match(d.notice ?? "", /privacy check unavailable/);
 });
 
-test("category routing: code → claude, live → gpt, general stays", () => {
-	assert.deepEqual(decide(onClaude, signals({ category: { label: "live", p: 1 } }), config).target, {
-		kind: "lane",
-		lane: "gpt",
-	});
-	const onGpt: RouterState = { lane: "gpt", locked: false };
-	assert.deepEqual(decide(onGpt, signals({ category: { label: "code", p: 1 } }), config).target, {
-		kind: "lane",
-		lane: "claude",
-	});
-	assert.deepEqual(decide(onGpt, signals({ category: { label: "general", p: 1 } }), config).target, {
-		kind: "lane",
-		lane: "gpt",
-	});
+test("category routing: code and live take the first usable entry of their list; general stays", () => {
+	assert.deepEqual(decide(onSonnet, signals({ category: { label: "live", p: 1 } }), config).target, model(GPT));
+	assert.deepEqual(decide(onGpt, signals({ category: { label: "code", p: 1 } }), config).target, model(SONNET));
+	assert.deepEqual(decide(onGpt, signals({ category: { label: "general", p: 1 } }), config).target, model(GPT));
 });
 
-test("state is only rewritten when the lane changes", () => {
-	assert.equal(decide(onClaude, signals({ category: { label: "code", p: 1 } }), config).state, undefined);
-	assert.deepEqual(decide(onClaude, signals({ category: { label: "live", p: 1 } }), config).state, {
-		lane: "gpt",
+test("state is rewritten only when the model or route changes", () => {
+	assert.equal(decide(onSonnet, signals({ category: { label: "code", p: 1 } }), config).state, undefined);
+	assert.deepEqual(decide(onSonnet, signals({ category: { label: "live", p: 1 } }), config).state, {
+		model: GPT,
+		route: "live",
 		locked: false,
 	});
 });
 
-test("classifier failure stays on the current lane with a notice", () => {
-	const d = decide({ lane: "gpt", locked: false }, signals({ category: "error" }), config);
-	assert.deepEqual(d.target, { kind: "lane", lane: "gpt" });
-	assert.equal(d.why, "classifier down");
-});
-
-test("pin overrides the category and can swap the model", () => {
-	const d = decide(
-		onClaude,
-		signals({
-			category: { label: "live", p: 1 },
-			pin: { lane: "claude", model: "anthropic/claude-opus-5" },
-			pinName: "claude-max",
-		}),
-		config,
-	);
-	assert.deepEqual(d.target, { kind: "ref", ref: "anthropic/claude-opus-5", lane: "claude" });
-	assert.equal(d.why, "pin:claude-max");
-});
-
-test("continuation and direct reuse the previous model", () => {
-	for (const reason of ["continuation", "direct"] as const) {
-		assert.deepEqual(decide(onClaude, signals({ reason, hasPrevious: true }), config).target, { kind: "previous" });
-	}
-	assert.deepEqual(decide(undefined, signals({ reason: "direct" }), config).target, { kind: "lane", lane: "claude" });
-});
-
-test("an unreadable branch routes local without persisting a lock", () => {
-	const d = decide(onClaude, signals({ branchReadable: false }), config);
-	assert.deepEqual(d.target, { kind: "lane", lane: "local" });
+test("a low-confidence label stays on the current model", () => {
+	const d = decide(onGpt, signals({ category: { label: "code", p: 0.3 } }), config);
+	assert.deepEqual(d.target, model(GPT));
 	assert.equal(d.state, undefined);
 });
 
-test("quota failover goes cloud to cloud with a cooldown", () => {
+test("classifier failure stays on the current model with a notice", () => {
+	const d = decide(onGpt, signals({ category: "error" }), config);
+	assert.deepEqual(d.target, model(GPT));
+	assert.equal(d.why, "classifier down");
+	assert.match(d.notice ?? "", /classifier down/);
+});
+
+test("a three-provider list skips a cooling provider and reports why", () => {
+	const cooling: RoutedState = { ...onSonnet, cooldowns: { anthropic: SOON } };
+	const d = decide(cooling, signals({ category: { label: "code", p: 1 } }), threeProviders);
+	assert.deepEqual(d.target, model(GEMINI));
+	assert.deepEqual(d.skipped, [{ ref: SONNET, reason: "cooling", until: SOON }]);
+	assert.equal(d.state?.cooldowns?.anthropic, SOON);
+});
+
+test("one provider cooldown covers every model of that account", () => {
+	const sameAccount = { ...DEFAULT_CONFIG, routes: { ...DEFAULT_CONFIG.routes, code: [SONNET, OPUS, GPT] } };
+	const cooling: RoutedState = { ...onGpt, cooldowns: { anthropic: SOON } };
+	const d = decide(cooling, signals({ category: { label: "code", p: 1 } }), sameAccount);
+	assert.deepEqual(d.target, model(GPT));
+	assert.deepEqual(
+		d.skipped?.map((entry) => entry.ref),
+		[SONNET, OPUS],
+	);
+});
+
+test("a model without credentials is skipped and reported", () => {
+	const d = decide(onGpt, signals({ category: { label: "code", p: 1 } }, { [SONNET]: "no-credentials" }), config);
+	assert.deepEqual(d.target, model(GPT));
+	assert.deepEqual(d.skipped, [{ ref: SONNET, reason: "no-credentials" }]);
+});
+
+test("general as a list routes confident general messages; low confidence still stays", () => {
+	const generalList = { ...DEFAULT_CONFIG, routes: { ...DEFAULT_CONFIG.routes, general: [GEMINI] } };
+	const confident = decide(onGpt, signals({ category: { label: "general", p: 0.9 } }), generalList);
+	assert.deepEqual(confident.target, model(GEMINI));
+	assert.equal(confident.state?.route, "general");
+	assert.deepEqual(decide(onGpt, signals({ category: { label: "general", p: 0.3 } }), generalList).target, model(GPT));
+});
+
+test("nothing usable refuses with every skipped model and why, never the private model", () => {
+	const cooling: RoutedState = { ...onSonnet, cooldowns: { anthropic: SOON } };
+	assert.throws(
+		() => decide(cooling, signals({ category: { label: "code", p: 1 } }, { [GPT]: "no-credentials" }), config),
+		(error: unknown) =>
+			error instanceof RouterError &&
+			/No usable model for code: anthropic\/claude-sonnet-5 \(cooling until \d\d:\d\d\), openai-codex\/gpt-6-sol \(no credentials\)/.test(
+				error.message,
+			),
+	);
+});
+
+test("staying on the current model refuses when it and the whole fallback chain are unusable", () => {
+	const allCooling: RoutedState = { ...onSonnet, cooldowns: { anthropic: SOON, "openai-codex": SOON } };
+	assert.throws(
+		() => decide(allCooling, signals({ category: { label: "general", p: 1 } }), config),
+		(error: unknown) => error instanceof RouterError && /^No usable model for general: /.test(error.message),
+	);
+});
+
+test("a continuation refuses when its provider and the rest of its route list are unusable", () => {
+	const allCooling: RoutedState = { ...onSonnet, cooldowns: { anthropic: SOON, "openai-codex": SOON } };
+	assert.throws(
+		() => decide(allCooling, signals({ reason: "continuation", previous: SONNET }), config),
+		(error: unknown) => error instanceof RouterError && /^No usable model for continuation: /.test(error.message),
+	);
+});
+
+test("staying on a model whose provider is cooling falls back to the chain", () => {
+	const cooling: RoutedState = { ...onGpt, cooldowns: { "openai-codex": SOON } };
+	const d = decide(cooling, signals({ category: { label: "general", p: 1 } }), config);
+	assert.deepEqual(d.target, model(SONNET));
+	assert.equal(d.state?.route, "default");
+});
+
+test("with no state, the first message uses defaultModel", () => {
+	const d = decide(undefined, signals({ category: { label: "general", p: 1 } }), config);
+	assert.deepEqual(d.target, model(SONNET));
+	assert.deepEqual(d.state, { model: SONNET, route: "default", locked: false });
+});
+
+test("a pin overrides the category", () => {
+	const d = decide(onSonnet, signals({ category: { label: "live", p: 1 }, pin: OPUS, pinName: "claude-max" }), config);
+	assert.deepEqual(d.target, model(OPUS));
+	assert.equal(d.why, "pin:claude-max");
+	assert.equal(d.state?.route, "pin");
+});
+
+test("a pin pauses while its provider cools down, then normal routing applies", () => {
+	const cooling: RoutedState = { ...onGpt, cooldowns: { anthropic: SOON } };
+	const d = decide(cooling, signals({ category: { label: "code", p: 1 }, pin: OPUS, pinName: "claude-max" }), config);
+	assert.deepEqual(d.target, model(GPT));
+	assert.match(d.notice ?? "", /claude-max paused: anthropic is cooling down/);
+});
+
+test("a pinned model without credentials refuses instead of falling through", () => {
+	assert.throws(
+		() => decide(onSonnet, signals({ pin: OPUS, pinName: "claude-max" }, { [OPUS]: "no-credentials" }), config),
+		/Pinned model anthropic\/claude-opus-5 has no credentials/,
+	);
+});
+
+test("continuation and direct reuse the model mid-turn", () => {
+	for (const reason of ["continuation", "direct"] as const) {
+		assert.deepEqual(decide(onSonnet, signals({ reason, previous: SONNET }), config).target, { kind: "previous" });
+	}
+	assert.deepEqual(decide(undefined, signals({ reason: "direct" }), config).target, model(SONNET));
+});
+
+test("a continuation whose provider is cooling continues down the saved route's list", () => {
+	const cooling: RoutedState = { ...onSonnet, cooldowns: { anthropic: SOON } };
+	const d = decide(cooling, signals({ reason: "continuation", previous: SONNET }), config);
+	assert.deepEqual(d.target, model(GPT));
+	assert.match(d.why, /anthropic cooling down/);
+	assert.equal(d.state?.model, GPT);
+	assert.equal(d.state?.cooldowns?.anthropic, SOON);
+});
+
+test("an unreadable branch routes to the private model without persisting a lock", () => {
+	const d = decide(onSonnet, signals({ branchReadable: false }), config);
+	assert.deepEqual(d.target, { kind: "private" });
+	assert.equal(d.state, undefined);
+});
+
+test("a usage-limit retry cools the provider and moves to the next usable model", () => {
 	const d = decide(
-		onClaude,
-		signals({ reason: "retry", hasPrevious: true, hasFailed: true, failedLane: "claude", failedIsQuota: true }),
+		onSonnet,
+		signals({ reason: "retry", previous: SONNET, failed: SONNET, failedIsQuota: true }),
 		config,
 	);
-	assert.deepEqual(d.target, { kind: "lane", lane: "gpt" });
-	assert.equal(d.state?.cooldowns?.claude, new Date(NOW + 60 * 60_000).toISOString());
+	assert.deepEqual(d.target, model(GPT));
+	assert.equal(d.state?.cooldowns?.anthropic, HOUR);
+	assert.match(d.notice ?? "", /anthropic usage limit reached; using openai-codex\/gpt-6-sol for 60 min/);
 });
 
-test("non-quota retries and retries without a failover lane stay on the failed model", () => {
-	const base = { reason: "retry" as const, hasPrevious: true, hasFailed: true, failedLane: "claude" as const };
-	assert.deepEqual(decide(onClaude, signals(base), config).target, { kind: "failed" });
-	assert.deepEqual(decide(onClaude, signals({ ...base, failedIsQuota: true, disabled: ["gpt"] }), config).target, {
-		kind: "failed",
-	});
-});
-
-test("a lane in cooldown is skipped by category routing", () => {
-	const cooling: RouterState = {
-		lane: "gpt",
-		locked: false,
-		cooldowns: { claude: new Date(NOW + 60_000).toISOString() },
-	};
-	assert.deepEqual(decide(cooling, signals({ category: { label: "code", p: 1 } }), config).target, {
-		kind: "lane",
-		lane: "gpt",
-	});
-	const expired: RouterState = { ...cooling, cooldowns: { claude: new Date(NOW - 1).toISOString() } };
-	assert.deepEqual(decide(expired, signals({ category: { label: "code", p: 1 } }), config).target, {
-		kind: "lane",
-		lane: "claude",
-	});
-});
-
-test("routing to a disabled lane is an error, never a silent substitute", () => {
-	assert.throws(() => decide(undefined, signals({ disabled: ["claude"] }), config), RouterError);
-	assert.throws(
-		() => decide(undefined, signals({ disabled: ["claude"] }), config),
-		/lanes\.claude.*privacy-router\.json/,
-	);
-});
-
-test("chooseLane hysteresis (spec §5.1)", () => {
-	const none = new Set<"claude" | "gpt">();
-	const base = { current: undefined, previous: undefined, p: 1, unavailable: none };
-	assert.equal(chooseLane({ ...base, category: "general" }, config), "claude");
-	assert.equal(chooseLane({ ...base, category: "general", previous: "gpt" }, config), "gpt");
-	assert.equal(chooseLane({ ...base, category: "general", current: "gpt", previous: "claude" }, config), "gpt");
-	assert.equal(chooseLane({ ...base, category: "live", current: "claude" }, config), "gpt");
-	assert.equal(chooseLane({ ...base, category: "live", current: "claude", p: 0.59 }, config), "claude");
-	assert.equal(chooseLane({ ...base, category: "code", current: "gpt" }, config), "claude");
-	assert.equal(
-		chooseLane({ ...base, category: "code", current: "gpt", unavailable: new Set(["claude"]) }, config),
-		"gpt",
+test("other retries, and usage-limit retries with nowhere to go, stay on the failed model", () => {
+	const base = { reason: "retry" as const, previous: SONNET, failed: SONNET };
+	assert.deepEqual(decide(onSonnet, signals(base), config).target, { kind: "failed" });
+	assert.deepEqual(
+		decide(onSonnet, signals({ ...base, failedIsQuota: true }, { [GPT]: "no-credentials" }), config).target,
+		{ kind: "failed" },
 	);
 });
 
 test("needsClassification only for clean user turns", () => {
-	assert.equal(needsClassification(onClaude, signals()), true);
-	assert.equal(needsClassification(onClaude, signals({ reason: "continuation" })), false);
+	assert.equal(needsClassification(onSonnet, signals()), true);
+	assert.equal(needsClassification(onSonnet, signals({ reason: "continuation" })), false);
 	assert.equal(needsClassification(locked, signals()), false);
-	assert.equal(needsClassification(onClaude, signals({ secret: "x" })), false);
-	assert.equal(needsClassification(onClaude, signals({ pathMention: "~/x" })), false);
+	assert.equal(needsClassification(onSonnet, signals({ secret: "x" })), false);
+	assert.equal(needsClassification(onSonnet, signals({ pathMention: "~/x" })), false);
 });
 
 test("isQuotaError", () => {
@@ -215,7 +281,6 @@ test("isQuotaError", () => {
 		),
 		true,
 	);
-	// Review M5: transient throttling is retried by pi, not a reason to switch lanes for an hour.
 	assert.equal(isQuotaError("429 Too Many Requests"), false);
 	assert.equal(isQuotaError("rate_limit_error: Number of requests exceeds your per-minute rate limit"), false);
 	assert.equal(isQuotaError("529 overloaded_error"), false);
@@ -223,81 +288,53 @@ test("isQuotaError", () => {
 });
 
 test("a lock notice names the reason and warns that the local model may be loading", () => {
-	const d = decide(onClaude, signals({ privateTag: true }), config);
+	const d = decide(onSonnet, signals({ privateTag: true }), config);
 	assert.match(d.notice ?? "", /^🔒 locked · tag · #private · loading local model/);
 });
 
-test("review M6: a pin pauses while its lane is in quota cooldown", () => {
-	const afterFailover: RouterState = {
-		lane: "gpt",
-		locked: false,
-		cooldowns: { claude: new Date(NOW + 30 * 60_000).toISOString() },
-	};
-	const d = decide(
-		afterFailover,
-		signals({
-			category: { label: "code", p: 1 },
-			pin: { lane: "claude", model: "anthropic/claude-opus-5" },
-			pinName: "claude-max",
-		}),
-		config,
-	);
-	assert.deepEqual(d.target, { kind: "lane", lane: "gpt" });
-	assert.match(d.notice ?? "", /claude-max.*paused/);
-});
-
-test("a current lane in cooldown gives way to the other lane, even for general messages", () => {
-	const soon = new Date(NOW + 60_000).toISOString();
-	const cooling: RouterState = { lane: "claude", locked: false, cooldowns: { claude: soon } };
-	for (const label of ["general", "code"] as const) {
-		const d = decide(cooling, signals({ category: { label, p: 1 } }), config);
-		assert.deepEqual(d.target, { kind: "lane", lane: "gpt" }, label);
-		assert.equal(d.state?.lane, "gpt", label);
-	}
-	assert.deepEqual(decide(cooling, signals({ category: "error" }), config).target, { kind: "lane", lane: "gpt" });
-	// Both lanes exhausted: nothing better than the current lane.
-	const both: RouterState = { ...cooling, cooldowns: { claude: soon, gpt: soon } };
-	assert.deepEqual(decide(both, signals({ category: { label: "code", p: 1 } }), config).target, {
-		kind: "lane",
-		lane: "claude",
-	});
-});
-
-test("a continuation whose previous lane is cooling down moves to the other lane", () => {
-	const cooling: RouterState = {
-		lane: "claude",
-		locked: false,
-		cooldowns: { claude: new Date(NOW + 60_000).toISOString() },
-	};
-	const d = decide(cooling, signals({ reason: "continuation", hasPrevious: true, previousLane: "claude" }), config);
-	assert.deepEqual(d.target, { kind: "lane", lane: "gpt" });
-	assert.equal(d.state?.lane, "gpt");
-	assert.equal(d.state?.cooldowns?.claude, cooling.cooldowns?.claude);
-	// Without a cooldown, a continuation stays on the model that is mid-turn.
-	assert.deepEqual(
-		decide(onClaude, signals({ reason: "continuation", hasPrevious: true, previousLane: "claude" }), config).target,
-		{ kind: "previous" },
-	);
-});
-
-test("planQuotaFailover: a usage-limit error on one cloud lane fails over to the other for the cooldown", () => {
-	const failure = {
-		lane: "claude" as const,
+test("planQuotaFailover: cool the failed provider and continue only if a usable model remains", () => {
+	const base = {
+		state: onSonnet,
+		failed: SONNET,
 		message: "You're out of extra usage. Add more at claude.ai/settings/usage",
+		availability: (): Availability => "ok",
+		now: NOW,
 	};
-	const base = { state: onClaude, disabled: [] as ("claude" | "gpt")[], now: NOW };
-	assert.deepEqual(planQuotaFailover({ ...base, failure }, config), {
-		from: "claude",
-		to: "gpt",
-		until: new Date(NOW + 60 * 60_000).toISOString(),
+	assert.deepEqual(planQuotaFailover(base, config), { provider: "anthropic", until: HOUR, to: GPT });
+	assert.equal(planQuotaFailover({ ...base, message: "500 internal error" }, config), undefined);
+	const gptCooling: RoutedState = { ...onSonnet, cooldowns: { "openai-codex": SOON } };
+	assert.equal(planQuotaFailover({ ...base, state: gptCooling }, config), undefined);
+	const withoutGoogle = (ref: string): Availability => (ref === GEMINI ? "no-credentials" : "ok");
+	assert.deepEqual(planQuotaFailover({ ...base, availability: withoutGoogle }, threeProviders), {
+		provider: "anthropic",
+		until: HOUR,
+		to: GPT,
 	});
-	assert.equal(
-		planQuotaFailover({ ...base, failure: { ...failure, message: "500 internal error" } }, config),
-		undefined,
+});
+
+test("a zero cooldown never fails over to the failed provider itself", () => {
+	const zero = { ...config, quotaCooldownMinutes: 0 };
+	const base = {
+		state: onGpt,
+		failed: GPT,
+		message: "You have reached your usage limit",
+		availability: (): Availability => "ok",
+		now: NOW,
+	};
+	const onlyGpt = (ref: string): Availability => (ref === GPT ? "ok" : "no-credentials");
+	assert.equal(planQuotaFailover({ ...base, availability: onlyGpt }, zero), undefined);
+	// On the code route Sonnet comes first, so it is the other provider's usable model.
+	assert.deepEqual(planQuotaFailover({ ...base, state: onSonnet }, zero), {
+		provider: "openai-codex",
+		until: new Date(NOW).toISOString(),
+		to: SONNET,
+	});
+
+	const retry = decide(
+		onGpt,
+		signals({ reason: "retry", failed: GPT, failedIsQuota: true }, { [SONNET]: "no-credentials" }),
+		zero,
 	);
-	assert.equal(planQuotaFailover({ ...base, failure: { ...failure, lane: "local" } }, config), undefined);
-	assert.equal(planQuotaFailover({ ...base, failure, disabled: ["gpt"] }, config), undefined);
-	// Both lanes exhausted: stop instead of bouncing between them.
-	const gptCooling: RouterState = { ...onClaude, cooldowns: { gpt: new Date(NOW + 60_000).toISOString() } };
-	assert.equal(planQuotaFailover({ ...base, state: gptCooling, failure }, config), undefined);
+	assert.deepEqual(retry.target, { kind: "failed" });
+	assert.equal(retry.why, "retry (no failover model)");
 });

@@ -6,19 +6,9 @@
  * `router.command` entries, which `route()` and the guards read from the branch.
  */
 
-export type Lane = "claude" | "gpt" | "local";
-export type CloudLane = Exclude<Lane, "local">;
-export type LockReason = "tag" | "command" | "cwd" | "path" | "secret" | "pii";
+import type { StoredState } from "./routes.ts";
 
-export interface RouterState {
-	lane: Lane;
-	/** Once true on a branch, never false on that branch. */
-	locked: boolean;
-	lockReason?: LockReason;
-	lockDetail?: string;
-	/** ISO time until which a quota-exhausted cloud lane is skipped. */
-	cooldowns?: Partial<Record<CloudLane, string>>;
-}
+export type LockReason = "tag" | "command" | "cwd" | "path" | "secret" | "pii";
 
 /** `leave-local` only marks where /leave-local moved the session, so a reopened session resumes there. */
 export type RouterCommand =
@@ -27,7 +17,9 @@ export type RouterCommand =
 	| { kind: "unpin" }
 	| { kind: "leave-local" }
 	/** Written when a usage-limit error ends a turn; see the agent_before_settle handler. */
-	| { kind: "cooldown"; lane: CloudLane; until: string };
+	| { kind: "cooldown"; provider: string; until: string }
+	/** 0.1 form, keyed by lane name; upgradeState (routes.ts) translates it to a provider. */
+	| { kind: "cooldown"; lane: "claude" | "gpt"; until: string };
 
 export const ROUTER_PROVIDER = "privacy-router";
 /** The id before the public release; sessions written under it keep their state and lock. */
@@ -47,26 +39,29 @@ export interface BranchEntry {
 export interface CommandView {
 	lockRequested: boolean;
 	pin: string | undefined;
-	/** Latest end time per lane. */
-	cooldowns: Partial<Record<CloudLane, string>>;
+	/** Latest end time per provider, or per 0.1 lane name ("claude" | "gpt") for 0.1 entries. */
+	cooldowns: Record<string, string>;
 }
 
-function isRouterState(value: unknown): value is RouterState {
+function isStoredState(value: unknown): value is StoredState {
 	if (typeof value !== "object" || value === null) return false;
-	const state = value as Partial<RouterState>;
-	return typeof state.lane === "string" && typeof state.locked === "boolean";
+	const state = value as Record<string, unknown>;
+	return (
+		typeof state.locked === "boolean" &&
+		(state.lane === undefined || typeof state.lane === "string") &&
+		(state.model === undefined || typeof state.model === "string") &&
+		(state.route === undefined || typeof state.route === "string")
+	);
 }
 
-/** Latest router state stored on the branch for `privacy-router/auto` (or the pre-release `router/auto`). */
-export function readRouterState(branch: readonly BranchEntry[]): RouterState | undefined {
+/** Latest stored state (0.1 or 0.2) on the branch for `privacy-router/auto` or the pre-release `router/auto`. */
+export function readRouterState(branch: readonly BranchEntry[]): StoredState | undefined {
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i];
 		if (entry.type !== "custom" || entry.customType !== VIRTUAL_MODEL_STATE_ENTRY) continue;
 		const data = entry.data as { provider?: unknown; modelId?: unknown; state?: unknown } | undefined;
 		const ours = data?.provider === ROUTER_PROVIDER || data?.provider === LEGACY_ROUTER_PROVIDER;
-		if (ours && data?.modelId === ROUTER_MODEL_ID && isRouterState(data.state)) {
-			return data.state;
-		}
+		if (ours && data?.modelId === ROUTER_MODEL_ID && isStoredState(data.state)) return data.state;
 	}
 	return undefined;
 }
@@ -75,7 +70,7 @@ export function readRouterState(branch: readonly BranchEntry[]): RouterState | u
 export function readCommands(branch: readonly BranchEntry[]): CommandView {
 	let lockRequested = false;
 	let pin: string | undefined;
-	const cooldowns: Partial<Record<CloudLane, string>> = {};
+	const cooldowns: Record<string, string> = {};
 	for (const entry of branch) {
 		if (entry.type !== "custom" || entry.customType !== COMMAND_ENTRY) continue;
 		const command = entry.data as RouterCommand | undefined;
@@ -83,9 +78,9 @@ export function readCommands(branch: readonly BranchEntry[]): CommandView {
 		else if (command?.kind === "pin") pin = command.target;
 		else if (command?.kind === "unpin") pin = undefined;
 		else if (command?.kind === "cooldown") {
-			const current = cooldowns[command.lane];
-			if (current === undefined || Date.parse(command.until) > Date.parse(current))
-				cooldowns[command.lane] = command.until;
+			const key = "provider" in command ? command.provider : command.lane;
+			const current = cooldowns[key];
+			if (current === undefined || Date.parse(command.until) > Date.parse(current)) cooldowns[key] = command.until;
 		}
 	}
 	return { lockRequested, pin, cooldowns };

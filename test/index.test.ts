@@ -23,6 +23,18 @@ const models: Model[] = [
 		api: "openai-codex-responses",
 	},
 	{
+		provider: "google",
+		id: "gemini-3-pro",
+		baseUrl: "https://generativelanguage.googleapis.com",
+		api: "google-generative-ai",
+	},
+	{
+		provider: "openrouter",
+		id: "anthropic/claude-x",
+		baseUrl: "https://openrouter.ai/api/v1",
+		api: "openai-completions",
+	},
+	{
 		provider: "ollama",
 		id: "qwen3.6:35b-pi",
 		baseUrl: "http://localhost:11434/v1",
@@ -37,10 +49,11 @@ const find = (provider: string, id: string) => models.find((m) => m.provider ===
 
 type Entry = { type: string; customType?: string; data?: unknown };
 
-function harness(catalog: Model[] = models, deps?: RouterDeps) {
+function harness(catalog: Model[] = models, deps?: RouterDeps, auth: (model: Model) => boolean = () => true) {
 	const lookup = (provider: string, id: string) => catalog.find((m) => m.provider === provider && m.id === id);
 	let branchAt: ((fromId: string) => Entry[]) | undefined;
 	let idle = true;
+	let status: string | undefined;
 	let cwd = join(homedir(), "Coding", "app");
 	const navigations: { id: string; options: unknown }[] = [];
 	let aborts = 0;
@@ -83,11 +96,16 @@ function harness(catalog: Model[] = models, deps?: RouterDeps) {
 	const ctx = () => ({
 		cwd,
 		hasUI: true,
-		ui: { notify: (message: string) => notices.push(message), setStatus: () => {} },
+		ui: {
+			notify: (message: string) => notices.push(message),
+			setStatus: (_key: string, text: string) => {
+				status = text;
+			},
+		},
 		sessionManager: { getBranch: (fromId?: string) => (fromId && branchAt ? branchAt(fromId) : entries) },
 		modelRegistry: {
 			find: lookup,
-			hasConfiguredAuth: () => true,
+			hasConfiguredAuth: (model: Model) => auth(model),
 			getApiKeyAndHeaders: async (model: Model) => ({ ok: true, apiKey: `key-${model.provider}` }),
 		},
 		model: selected,
@@ -120,6 +138,7 @@ function harness(catalog: Model[] = models, deps?: RouterDeps) {
 		route,
 		entries,
 		notices,
+		status: () => status,
 		tools: () => activeTools,
 		selected: () => selected,
 		aborts: () => aborts,
@@ -183,7 +202,7 @@ test("a coding request routes to the claude lane", async () => {
 	ollama.category = "code";
 	const result = await h.route({ reason: "user", messages: [user("write a python script")] });
 	assert.equal(result.model.id, "claude-sonnet-5");
-	assert.deepEqual(result.state, { lane: "claude", locked: false });
+	assert.deepEqual(result.state, { model: "anthropic/claude-sonnet-5", route: "code", locked: false });
 });
 
 test("a live-data request routes to the gpt lane", async () => {
@@ -664,11 +683,13 @@ test("a Claude usage-limit error fails the turn over to GPT and retries it there
 	assert.equal(result.continue, true);
 	const [cooldown, omit] = result.entries;
 	assert.equal(cooldown.customType, COMMAND_ENTRY);
-	assert.equal((cooldown.data as { kind: string; lane: string }).kind, "cooldown");
-	assert.equal((cooldown.data as { lane: string }).lane, "claude");
+	assert.equal((cooldown.data as { kind: string }).kind, "cooldown");
+	assert.equal((cooldown.data as { provider: string }).provider, "anthropic");
 	// The failed attempt leaves the model's context, as in pi's own retries.
 	assert.deepEqual(omit, { type: "context_edit", targetId: "a1", replacement: null });
-	assert.ok(h.notices.some((notice) => /claude.*gpt/.test(notice)));
+	assert.ok(
+		h.notices.some((notice) => /anthropic usage limit reached; retrying on openai-codex\/gpt-6-sol/.test(notice)),
+	);
 
 	// pi commits the entries and asks for one more request; the router sends it to GPT.
 	h.entries.push(cooldown as Entry);
@@ -698,4 +719,146 @@ test("/privacy shows the router status, and /router is left free for other exten
 	assert.ok(!h.commandNames().includes("router"));
 	await h.command("privacy");
 	assert.ok(h.notices.some((notice) => notice.startsWith("selected: privacy-router/auto")));
+});
+
+async function withConfig<T>(config: object, run: () => Promise<T>): Promise<T> {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-router-routes-")), "privacy-router.json");
+	writeFileSync(path, JSON.stringify(config));
+	const previous = process.env.PI_PRIVACY_ROUTER_CONFIG;
+	process.env.PI_PRIVACY_ROUTER_CONFIG = path;
+	try {
+		return await run();
+	} finally {
+		if (previous === undefined) delete process.env.PI_PRIVACY_ROUTER_CONFIG;
+		else process.env.PI_PRIVACY_ROUTER_CONFIG = previous;
+	}
+}
+
+const settleEvent = { type: "agent_before_settle", outcome: "error" };
+
+test("a model without credentials is skipped with one notice per session", async () => {
+	const h = harness(models, undefined, (model) => model.provider !== "anthropic");
+	ollama.category = "code";
+	const first = await h.route({ reason: "user", messages: [user("refactor the parser")] });
+	assert.equal(first.model.id, "gpt-6-sol");
+	await h.route({ reason: "user", messages: [user("now add tests")] });
+	const notices = h.notices.filter((notice) => notice.includes("has no credentials"));
+	assert.deepEqual(notices, ["anthropic/claude-sonnet-5 has no credentials; using openai-codex/gpt-6-sol for code"]);
+});
+
+test("usage-limit failover continues across three providers", async () => {
+	await withConfig(
+		{ routes: { code: ["anthropic/claude-sonnet-5", "google/gemini-3-pro", "openai-codex/gpt-6-sol"] } },
+		async () => {
+			const h = harness();
+			h.replaceBranch(quotaFailure());
+			const first = (await h.emit("agent_before_settle", settleEvent)) as SettleResult;
+			assert.ok(first);
+			assert.equal((first.entries[0].data as { provider: string }).provider, "anthropic");
+			h.entries.push(first.entries[0] as Entry);
+			ollama.category = "code";
+			assert.equal(
+				(await h.route({ reason: "user", messages: [user("refactor the wizard")] })).model.id,
+				"gemini-3-pro",
+			);
+
+			h.replaceBranch([...quotaFailure("google", "gemini-3-pro"), first.entries[0] as Entry]);
+			const second = (await h.emit("agent_before_settle", settleEvent)) as SettleResult;
+			assert.ok(second);
+			assert.equal((second.entries[0].data as { provider: string }).provider, "google");
+			h.entries.push(second.entries[0] as Entry);
+			assert.equal((await h.route({ reason: "user", messages: [user("refactor the wizard")] })).model.id, "gpt-6-sol");
+		},
+	);
+});
+
+test("no failover when no usable model would remain", async () => {
+	await withConfig(
+		{ routes: { code: ["anthropic/claude-sonnet-5"], live: ["anthropic/claude-sonnet-5"] } },
+		async () => {
+			const h = harness();
+			h.replaceBranch(quotaFailure());
+			assert.equal(await h.emit("agent_before_settle", settleEvent), undefined);
+		},
+	);
+});
+
+test("the router's own refusal is never treated as a provider usage limit", async () => {
+	const h = harness();
+	h.replaceBranch(
+		quotaFailure(
+			"privacy-router",
+			"auto",
+			"No usable model for code: anthropic/claude-sonnet-5 (cooling until 14:05) after a usage limit",
+		),
+	);
+	assert.equal(await h.emit("agent_before_settle", settleEvent), undefined);
+});
+
+test("a pin whose name left the config is ignored", async () => {
+	const h = harness();
+	h.replaceBranch([{ type: "custom", customType: COMMAND_ENTRY, data: { kind: "pin", target: "removed" } }]);
+	ollama.category = "code";
+	const result = await h.route({ reason: "user", messages: [user("write a test")] });
+	assert.equal(result.model.id, "claude-sonnet-5");
+});
+
+test("a ref with extra slashes routes through pi's registry", async () => {
+	await withConfig({ routes: { code: ["openrouter/anthropic/claude-x"] } }, async () => {
+		const h = harness();
+		ollama.category = "code";
+		const result = await h.route({ reason: "user", messages: [user("write a test")] });
+		assert.equal(result.model.provider, "openrouter");
+		assert.equal(result.model.id, "anthropic/claude-x");
+	});
+});
+
+test("the footer and /privacy show the current model and route", async () => {
+	const h = harness();
+	ollama.category = "code";
+	await h.route({ reason: "user", messages: [user("write a test")] });
+	assert.equal(h.status(), "→ claude-sonnet-5 · code");
+	await h.command("privacy");
+	assert.ok(h.notices.some((notice) => notice.includes("model: anthropic/claude-sonnet-5 · route: code")));
+});
+
+test("/privacy still shows the lock when the config is invalid", async () => {
+	await withConfig({ minProb: 2 }, async () => {
+		const h = harness();
+		h.replaceBranch([{ type: "custom", customType: COMMAND_ENTRY, data: { kind: "lock" } }]);
+		await h.command("privacy");
+		const status = h.notices.find((notice) => notice.startsWith("selected:"));
+		assert.ok(status?.includes("🔒 locked"));
+		assert.ok(status?.includes("INVALID"));
+	});
+});
+
+test("the settle hook never fails over a local model's error, even in an unlocked session", async () => {
+	const h = harness();
+	h.replaceBranch(quotaFailure("ollama", "qwen3.6:35b-pi", "You have reached your usage limit"));
+	assert.equal(await h.emit("agent_before_settle", settleEvent), undefined);
+});
+
+test("a 0.1 locked state passed as request.state stays on the private model", async () => {
+	const h = harness();
+	const state = { lane: "local", locked: true, lockReason: "pii", lockDetail: "x" };
+	const previous = { model: find("anthropic", "claude-sonnet-5"), thinkingLevel: "medium" };
+	const continued = await h.route({ reason: "continuation", state, messages: [user("go on")] });
+	assert.equal(continued.model.provider, "ollama");
+	const direct = await h.route({ reason: "direct", state, previous, messages: [user("go on")] });
+	assert.equal(direct.model.provider, "ollama");
+});
+
+test("a 0.1 gpt cooldown command with a 0.1 unlocked state keeps routing off openai-codex", async () => {
+	const h = harness();
+	const until = new Date(Date.now() + 60 * 60_000).toISOString();
+	h.replaceBranch([{ type: "custom", customType: COMMAND_ENTRY, data: { kind: "cooldown", lane: "gpt", until } }]);
+	ollama.category = "code";
+	const result = await h.route({
+		reason: "user",
+		state: { lane: "gpt", locked: false },
+		messages: [user("refactor the parser")],
+	});
+	assert.equal(result.model.id, "claude-sonnet-5");
+	assert.ok(Object.keys((result.state as { cooldowns?: object }).cooldowns ?? {}).includes("openai-codex"));
 });

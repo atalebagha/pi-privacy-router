@@ -4,14 +4,14 @@ A [pi](https://pi.dev) extension that adds one model, `privacy-router/auto`, whi
 
 | Your message | Goes to (default) | Why |
 |---|---|---|
-| Coding, debugging, planning | `anthropic/claude-sonnet-5` | strongest at code |
-| Live data: weather, news, prices, latest versions | `openai-codex/gpt-6-sol` | good at web lookups |
+| Coding, debugging, planning | `anthropic/claude-sonnet-5`, then `openai-codex/gpt-6-sol` | strongest at code |
+| Live data: weather, news, prices, latest versions | `openai-codex/gpt-6-sol`, then `anthropic/claude-sonnet-5` | good at web lookups |
 | Anything else | stays on the current model | avoids prompt-cache misses |
 | Anything private | a local Ollama model, **for the rest of the session** | never sent to an AI provider |
 
-A small local model (`qwen3:8b` by default, about 200 ms warm) reads each new message to pick the lane and to check for personal information. The models are defaults; set your own in `privacy-router.json`.
+Each category routes to the first usable model in its list: one pi has, with credentials, whose provider is not cooling down. A small local model (`qwen3:8b` by default, about 200 ms warm) reads each new message to pick the category and to check for personal information. Set your own models and order in `privacy-router.json`.
 
-When one cloud lane hits its plan's usage limit (for example Anthropic's "You're out of extra usage"), the router retries the turn on the other cloud lane and skips the exhausted one for 60 minutes (`quotaCooldownMinutes`). If both lanes are exhausted, the error is shown. Transient errors such as "overloaded" are retried by pi on the same model.
+When a provider hits its plan's usage limit (for example Anthropic's "You're out of extra usage"), the router cools that provider down for 60 minutes (`quotaCooldownMinutes`) and retries the turn on the next usable model in the list. A cooldown covers every model of that provider, because usage limits are per account. If no usable model is left, the error is shown. Transient errors such as "overloaded" are retried by pi on the same model.
 
 > Status: early (0.x). Privacy protection is best-effort; read [Known gaps](#known-gaps) before relying on it.
 
@@ -19,7 +19,7 @@ When one cloud lane hits its plan's usage limit (for example Anthropic's "You're
 
 - pi 0.99.1 or later
 - [Ollama](https://ollama.com) running locally
-- Credentials in pi for the cloud lanes you use (`/login`); a lane whose model is missing or not logged in is reported at startup
+- Credentials in pi (`/login`) for the models in your routes; unusable ones are reported at startup and skipped
 - RAM for the local models: the defaults (`qwen3:8b` classifier plus the 35B worker) need about 30 GB free; on smaller machines use a smaller local worker (see [Memory](#memory))
 
 ## Install
@@ -72,13 +72,13 @@ If the session was already long when it locked, the history will not fit the loc
 
 Once locked, only local tools run (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `todo`, `ask_user_question`), switching to a cloud model with `/model` is reverted, and prompt-cache warming stops. A session never unlocks in place: every request carries the whole conversation, so unlocking would send the private part on the next message. To use cloud models again, run `/leave-local` (below) or start a new session.
 
-On a cloud lane, reads of private paths and secret files (`.env`, `*.pem`, `id_*`, `auth.json`, …) are blocked before they happen.
+On a cloud model, reads of private paths and secret files (`.env`, `*.pem`, `id_*`, `auth.json`, …) are blocked before they happen.
 
 If Ollama is not running, messages are **refused**, not sent to the cloud unchecked. Set `"onPrivacyCheckFailure": "warn"` to trade that for availability.
 
 ## Memory
 
-The classifier and the local worker each need RAM while loaded. If your machine cannot keep both resident, loading the worker for a private session evicts the classifier. That is fine (a private session never calls the classifier), but the next normal message reloads the classifier cold, which takes a few seconds. Raise `"ollama": { "timeoutMs": 8000 }` so that message is not refused; the default is 1500 ms. With less RAM, register a smaller local worker and set `lanes.local` to it.
+The classifier and the local worker each need RAM while loaded. If your machine cannot keep both resident, loading the worker for a private session evicts the classifier. That is fine (a private session never calls the classifier), but the next normal message reloads the classifier cold, which takes a few seconds. Raise `"ollama": { "timeoutMs": 8000 }` so that message is not refused; the default is 1500 ms. With less RAM, register a smaller local worker and set `private` to it.
 
 ## Commands
 
@@ -86,27 +86,28 @@ The classifier and the local worker each need RAM while loaded. If your machine 
 |---|---|
 | `/local` | lock this session to the local model |
 | `/leave-local` | go back to the last cloud reply before the lock, without summarizing the private part; cloud routing resumes on your next message, and the private part stays on its own branch (`/tree` back to it locks again) |
-| `/route <claude\|claude-max\|gpt>` | pin a cloud model until `/route auto`; the pin pauses while its lane is cooling down after a usage limit |
+| `/route <name>` | pin the model named in `pins` until `/route auto`; the pin pauses while its provider is cooling down after a usage limit |
 | `/route auto` | back to automatic routing |
-| `/privacy` | lane, lock reason, pin, classifier health, last decision |
+| `/privacy` | selected and routed model, route, lock reason, pin, cooldowns per provider, config source, classifier health, last decision |
 
 ## Configuration: `~/.pi/agent/privacy-router.json`
 
-Every key is optional; missing keys use the defaults in `src/config.ts`. A file that exists but is invalid makes the router refuse requests until fixed (it is re-read on every request, so no restart is needed). Set `PI_PRIVACY_ROUTER_CONFIG` to use another path.
+Every key is optional; missing keys use the defaults in `src/config.ts`, and `routes` merges per category. A file that exists but is invalid makes the router refuse requests until fixed (it is re-read on every request, so no restart is needed). Set `PI_PRIVACY_ROUTER_CONFIG` to use another path.
 
 ```json
 {
 	"ollama": { "baseUrl": "http://localhost:11434", "classifierModel": "qwen3:8b", "timeoutMs": 1500, "keepAlive": "30m" },
-	"lanes": {
-		"claude": "anthropic/claude-sonnet-5",
-		"gpt": "openai-codex/gpt-6-sol",
-		"local": "ollama/qwen3.6:35b-pi"
+	"routes": {
+		"code": ["anthropic/claude-sonnet-5", "openai-codex/gpt-6-sol"],
+		"live": ["openai-codex/gpt-6-sol", "anthropic/claude-sonnet-5"],
+		"general": "stay"
 	},
-	"defaultLane": "claude",
-	"pinTargets": {
-		"claude": { "lane": "claude" },
-		"claude-max": { "lane": "claude", "model": "anthropic/claude-opus-5" },
-		"gpt": { "lane": "gpt" }
+	"private": "ollama/qwen3.6:35b-pi",
+	"defaultModel": "anthropic/claude-sonnet-5",
+	"pins": {
+		"claude": "anthropic/claude-sonnet-5",
+		"claude-max": "anthropic/claude-opus-5",
+		"gpt": "openai-codex/gpt-6-sol"
 	},
 	"minProb": 0.6,
 	"quotaCooldownMinutes": 60,
@@ -117,9 +118,18 @@ Every key is optional; missing keys use the defaults in `src/config.ts`. A file 
 }
 ```
 
+- `routes.code` / `routes.live`: models in failover order, from any providers pi supports. `routes.general`: `"stay"` keeps the current model; a list routes confident general messages to it.
+- `private`: the local model for locked sessions; it must be served from localhost.
+- `defaultModel`: used before any model has answered and first in the fallback chain; when omitted it defaults to the first `routes.code` model.
+- `pins`: `/route <name>` pins that model until `/route auto`.
+
 Add your own private folders to `sensitivePaths` (for example `"~/Documents/**"`). `ollama.baseUrl` must be a localhost URL: the classifier reads your private text.
 
 If you change `classifierModel`, run `npm run eval` from a clone of this repository first: the gates (category accuracy >= 90 %, no code/live misroutes, personal-information recall >= 95 %) are only verified for `qwen3:8b`.
+
+### Upgrading from 0.1
+
+0.1 files (`lanes`, `defaultLane`, `pinTargets`) keep working: they are translated when loaded, with `code` = [claude lane, gpt lane] and `live` = [gpt lane, claude lane]. Do not mix 0.1 and 0.2 keys in one file. Sessions from 0.1 keep their state, and a locked session stays locked. Going back to 0.1 after writing a 0.2-format `privacy-router.json` makes 0.1 refuse that file (it fails closed); locked sessions stay locked either way.
 
 ## Known gaps
 
