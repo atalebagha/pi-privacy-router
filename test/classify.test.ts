@@ -5,9 +5,11 @@ import {
 	isAcknowledgement,
 	lastChars,
 	MAX_CLASSIFY_CHARS,
+	MAX_PII_WINDOWS,
 	PII_LABELS,
 	parseLabel,
 	piiPrompt,
+	piiWindows,
 } from "../src/classify.ts";
 import { askOneWord } from "../src/ollama.ts";
 
@@ -28,6 +30,41 @@ test("classifier input keeps the last MAX_CLASSIFY_CHARS characters", () => {
 	assert.equal(lastChars(text), "b".repeat(MAX_CLASSIFY_CHARS));
 	assert.ok(piiPrompt(text).user.includes("b".repeat(MAX_CLASSIFY_CHARS)));
 	assert.ok(!piiPrompt(text).user.includes("a"));
+});
+
+test("the classifier window fits the 4096-token context", () => {
+	assert.equal(MAX_CLASSIFY_CHARS, 4000);
+	assert.equal(MAX_PII_WINDOWS, 16);
+});
+
+test("piiWindows: short text is one window", () => {
+	assert.deepEqual(piiWindows(""), [""]);
+	assert.deepEqual(piiWindows("hello"), ["hello"]);
+	const exact = "a".repeat(MAX_CLASSIFY_CHARS);
+	assert.deepEqual(piiWindows(exact), [exact]);
+});
+
+test("piiWindows: covers the whole text with 200 characters of overlap", () => {
+	const text = Array.from({ length: 10_000 }, (_, i) => String.fromCharCode(97 + (i % 26))).join("");
+	const windows = piiWindows(text);
+	assert.equal(windows.length, 3);
+	assert.ok(windows.every((w) => w.length <= MAX_CLASSIFY_CHARS));
+	assert.equal(windows[0], text.slice(0, MAX_CLASSIFY_CHARS));
+	assert.ok(text.endsWith(windows.at(-1) as string), "last window ends at the text end");
+	for (let i = 1; i < windows.length; i++) {
+		assert.equal(windows[i - 1].slice(-200), windows[i].slice(0, 200), `window ${i} overlaps by 200`);
+	}
+	// Rebuilding from the windows (dropping each overlap) gives the text back.
+	const rebuilt = windows.map((w, i) => (i === 0 ? w : w.slice(200))).join("");
+	assert.equal(rebuilt, text);
+});
+
+test("piiWindows: window count grows with length and hits the cap just past the limit", () => {
+	const step = MAX_CLASSIFY_CHARS - 200;
+	const atCap = MAX_CLASSIFY_CHARS + (MAX_PII_WINDOWS - 1) * step;
+	assert.equal(piiWindows("a".repeat(atCap)).length, MAX_PII_WINDOWS);
+	assert.equal(piiWindows("a".repeat(atCap + 1)).length, MAX_PII_WINDOWS + 1);
+	assert.equal(piiWindows("a".repeat(MAX_CLASSIFY_CHARS + 1)).length, 2);
 });
 
 test("askOneWord sends a native /api/chat request with a 4k context and reads logprobs", async () => {

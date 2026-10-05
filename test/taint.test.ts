@@ -147,3 +147,24 @@ test("findSensitiveToken in user text skips secret filenames", () => {
 	assert.equal(findSensitiveToken("summarize ~/private-docs/w2.pdf please", policy, false), "~/private-docs/w2.pdf");
 	assert.equal(findSensitiveToken("my .env has a bug in DATABASE_URL", policy, false), undefined);
 });
+
+test("findSecret does not backtrack catastrophically on a long run of keywords", () => {
+	const text = "token".repeat(40_000);
+	const start = performance.now();
+	findSecret(text);
+	const elapsed = performance.now() - start;
+	assert.ok(elapsed < 500, `took ${elapsed.toFixed(0)} ms`);
+});
+
+test("findSecret flags credentials in a URL only when the password looks real", () => {
+	assert.deepEqual(findSecret("postgres://admin:S3cr3tP4ss@db/app"), { pattern: "url-credentials" });
+	const clean = [
+		"postgresql://unicorn_user:magical_password@database:5432/x",
+		"https://user:password@example.com",
+		"redis://default:hunter2@cache:6379",
+		"mongodb://app:abcdefghij@host/db",
+		"postgres://app:12345678901@host/db",
+		"postgres://app:Fake1234Value@host/db",
+	];
+	for (const text of clean) assert.equal(findSecret(text), undefined, text);
+});

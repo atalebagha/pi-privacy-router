@@ -9,7 +9,11 @@ export const CATEGORIES: readonly Category[] = ["code", "live", "general"];
 export type PiiLabel = "yes" | "no";
 export const PII_LABELS: readonly PiiLabel[] = ["yes", "no"];
 
-export const MAX_CLASSIFY_CHARS = 6000;
+/** Fits the classifier's 4096-token context even for non-Latin text (about one token per character). */
+export const MAX_CLASSIFY_CHARS = 4000;
+const PII_WINDOW_OVERLAP = 200;
+/** A message needing more privacy windows than this is refused rather than checked. */
+export const MAX_PII_WINDOWS = 16;
 
 /**
  * The agent works on the user's machine, so "latest commit" or "installed version" is local work,
@@ -102,6 +106,20 @@ export interface Labeled<L extends string> {
 
 export function lastChars(text: string, max: number = MAX_CLASSIFY_CHARS): string {
 	return text.length <= max ? text : text.slice(-max);
+}
+
+/**
+ * Splits text into windows of MAX_CLASSIFY_CHARS with 200 characters of overlap, so personal data
+ * anywhere in a long message is seen by the privacy classifier. The first window starts at 0 and the
+ * last ends at the end of the text.
+ */
+export function piiWindows(text: string): string[] {
+	const windows: string[] = [];
+	const step = MAX_CLASSIFY_CHARS - PII_WINDOW_OVERLAP;
+	for (let start = 0; ; start += step) {
+		windows.push(text.slice(start, start + MAX_CLASSIFY_CHARS));
+		if (start + MAX_CLASSIFY_CHARS >= text.length) return windows;
+	}
 }
 
 export function categoryPrompt(text: string): Prompt {

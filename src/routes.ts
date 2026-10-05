@@ -1,8 +1,6 @@
 /**
  * Model routes: which configured model serves a request, and reading 0.1 router state. Pure:
  * index.ts supplies model availability from pi's registry.
- *
- * Spec: docs/superpowers/specs/2026-10-03-configurable-routes-design.md §4.2 and §5.
  */
 
 import type { LockReason } from "./state.ts";
@@ -37,7 +35,7 @@ export interface Usability {
 	now: number;
 }
 
-/** 0.2 router state (spec §4.1). */
+/** 0.2 router state. */
 export interface RoutedState {
 	model?: ModelRef;
 	route?: Route;
@@ -65,7 +63,7 @@ export interface StoredState {
 	cooldowns?: Record<string, string>;
 }
 
-/** Text before the first "/": `openrouter/anthropic/claude-x` → `openrouter` (spec §4.1). */
+/** Text before the first "/": `openrouter/anthropic/claude-x` → `openrouter`. */
 export function providerOf(ref: ModelRef): string {
 	const slash = ref.indexOf("/");
 	return slash === -1 ? ref : ref.slice(0, slash);
@@ -81,7 +79,7 @@ export function coolingUntil(
 	return until !== undefined && Date.parse(until) > now ? until : undefined;
 }
 
-/** Spec §4.2: the first usable entry, and the entries skipped before it with their reasons. */
+/** The first usable entry, and the entries skipped before it with their reasons. */
 export function firstUsable(list: readonly ModelRef[], usability: Usability): { ref?: ModelRef; skipped: Skipped[] } {
 	const skipped: Skipped[] = [];
 	for (const ref of list) {
@@ -104,12 +102,12 @@ export function isUsable(ref: ModelRef, usability: Usability): boolean {
 	return firstUsable([ref], usability).ref !== undefined;
 }
 
-/** Spec §4.2: `[defaultModel, ...code, ...live]`, first occurrence kept. */
+/** The fallback chain: `[defaultModel, ...code, ...live]`, first occurrence kept. */
 export function fallbackChain(config: RoutesConfig): ModelRef[] {
 	return [...new Set([config.defaultModel, ...config.routes.code, ...config.routes.live])];
 }
 
-/** The list a request continues down when its model's provider is cooling (spec §4.3, §4.5). */
+/** The list a request continues down when its model's provider is cooling down or hit a usage limit. */
 export function routeList(route: Route | undefined, config: RoutesConfig): ModelRef[] {
 	if (route === "code" || route === "live") return config.routes[route];
 	if (route === "general" && Array.isArray(config.routes.general)) return config.routes.general;
@@ -132,7 +130,7 @@ export function describeSkipped(skipped: readonly Skipped[]): string {
 		.join(", ");
 }
 
-/** Spec §5: the 0.2 model a 0.1 lane name stood for. */
+/** The 0.2 model a 0.1 lane name stood for. */
 export function legacyLaneModel(lane: "claude" | "gpt", config: RoutesConfig): ModelRef {
 	return lane === "claude" ? config.routes.code[0] : config.routes.live[0];
 }
@@ -142,7 +140,7 @@ function cooldownKey(key: string, config: RoutesConfig): string {
 }
 
 /**
- * Spec §5: stored state (0.1 or 0.2) plus cooldown commands, as 0.2 state. `locked` is copied
+ * Stored state (0.1 or 0.2) plus cooldown commands, as 0.2 state. `locked` is copied
  * unchanged on every path; a 0.1 lane name only ever becomes a model, a route, or a provider key.
  */
 export function upgradeState(

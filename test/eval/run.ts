@@ -2,7 +2,7 @@
  * Live classifier eval: `npm run eval`. Needs Ollama running with the classifier model.
  * Deliberately not part of `npm test`: results depend on the model build, not on our logic.
  *
- * Gates (spec §10.2): category accuracy >= 90 %, PII recall >= 95 %, and zero cross-lane misroutes
+ * Gates: category accuracy >= 90 %, PII recall >= 95 %, and zero cross-lane misroutes
  * (a `code` case labelled `live` or the reverse): those pick the wrong provider, while a miss into
  * `general` only keeps the current lane.
  */

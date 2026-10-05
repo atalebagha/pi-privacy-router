@@ -2,7 +2,7 @@
  * The routing brain. Pure: `decide()` maps signals gathered by index.ts to a target and new state.
  *
  * Privacy-path failures end in an error or the private model, never a silent cloud route.
- * Category-path failures mean "stay on the current model". Spec §4.3.
+ * Category-path failures mean "stay on the current model".
  */
 
 import type { Category } from "./classify.ts";
@@ -30,6 +30,13 @@ export class RouterError extends Error {
 	}
 }
 
+// pi retries an error automatically when its text looks transient ("timed out", "500", ...), so the
+// refusals carry no numbers, URLs or timeout wording. test/retryable.test.ts checks them.
+const TOO_LONG_REFUSAL =
+	"Text since the last cloud reply is too long to check for personal information. Add #private to keep this session on the local model, use /tree without a summary to go back to before the long text, or start a new session.";
+const CHECK_UNAVAILABLE_REFUSAL =
+	"Privacy check unavailable: the local classifier did not answer (not running, still loading, or too slow). Start Ollama, or wait for the model to load, and resend. The classifier settings are under ollama in privacy-router.json.";
+
 export type Reason = "user" | "continuation" | "retry" | "direct";
 
 export type Target = { kind: "private" } | { kind: "model"; ref: ModelRef } | { kind: "previous" } | { kind: "failed" };
@@ -47,8 +54,10 @@ export interface Signals {
 	/** Active pin and the model it pins (config `pins`). */
 	pinName?: string;
 	pin?: ModelRef;
-	/** Set by index.ts only when `needsClassification()` is true. */
-	pii?: "yes" | "no" | "error";
+	/** Set by index.ts when `needsClassification()` is true, and on other requests with new user-side text. */
+	pii?: "yes" | "no" | "error" | "too-long";
+	/** Characters of the checked text, for diagnostics; the refusal leaves it out (see TOO_LONG_REFUSAL). */
+	piiLength?: number;
 	category?: { label: Category; p: number } | "error";
 	/** Model of the latest successful reply (`request.previous`). */
 	previous?: ModelRef;
@@ -73,7 +82,7 @@ export interface Decision {
 
 export type PolicyConfig = Pick<
 	RouterConfig,
-	"routes" | "defaultModel" | "minProb" | "quotaCooldownMinutes" | "onPrivacyCheckFailure" | "ollama"
+	"routes" | "defaultModel" | "minProb" | "quotaCooldownMinutes" | "onPrivacyCheckFailure"
 >;
 
 /**
@@ -138,7 +147,7 @@ function currentModel(state: RoutedState | undefined, signals: Signals, config: 
 	return state?.model ?? signals.previous ?? config.defaultModel;
 }
 
-/** Spec §4.3 rule 3: stay on the current model if usable, else the first usable model of the fallback chain. */
+/** Stay on the current model if usable, else the first usable model of the fallback chain. */
 function stayOrFallback(state: RoutedState | undefined, signals: Signals, config: PolicyConfig, why: string): Decision {
 	const usability = usabilityOf(state, signals);
 	const current = currentModel(state, signals, config);
@@ -156,17 +165,21 @@ function stayOrFallback(state: RoutedState | undefined, signals: Signals, config
 	};
 }
 
+/** Text the privacy check could not read: block mode refuses it, warn mode routes on with this notice. */
+function uncheckedNotice(pii: "error" | "too-long", config: PolicyConfig): string {
+	const block = config.onPrivacyCheckFailure === "block";
+	if (pii === "too-long") {
+		if (block) throw new RouterError(TOO_LONG_REFUSAL);
+		return "⚠ text since the last cloud reply is too long to check for personal information; deterministic checks only";
+	}
+	if (block) throw new RouterError(CHECK_UNAVAILABLE_REFUSAL);
+	return "⚠ privacy check unavailable; deterministic checks only";
+}
+
 function decideUser(state: RoutedState | undefined, signals: Signals, config: PolicyConfig): Decision {
 	if (signals.pii === "yes") return lockNow(state, "pii", "personal information in message");
-	let notice: string | undefined;
-	if (signals.pii !== "no") {
-		if (config.onPrivacyCheckFailure === "block") {
-			throw new RouterError(
-				`Privacy check unavailable: Ollama not reachable at ${config.ollama.baseUrl}. Start Ollama and resend.`,
-			);
-		}
-		notice = "⚠ privacy check unavailable; deterministic checks only";
-	}
+	// A user turn whose check did not run counts as a failed check.
+	let notice = signals.pii === "no" ? undefined : uncheckedNotice(signals.pii ?? "error", config);
 
 	if (signals.pin !== undefined && signals.pinName !== undefined) {
 		const availability = signals.availability(signals.pin);
@@ -259,6 +272,27 @@ function decideRetry(state: RoutedState | undefined, signals: Signals, config: P
 	};
 }
 
+/**
+ * Retries can carry steering messages queued during the failed request, summaries (direct) text a
+ * refused turn left behind, and continuations text an extension added when it started the turn, so
+ * index.ts runs the privacy check on them as on user turns. `pii` stays undefined when there was no
+ * new text to check, as in an ordinary tool loop.
+ */
+function decideChecked(
+	state: RoutedState | undefined,
+	signals: Signals,
+	config: PolicyConfig,
+	reason: Exclude<Reason, "user">,
+): Decision {
+	if (signals.pii === "yes") return lockNow(state, "pii", "personal information in message");
+	const notice =
+		signals.pii === "error" || signals.pii === "too-long" ? uncheckedNotice(signals.pii, config) : undefined;
+	const decision =
+		reason === "retry" ? decideRetry(state, signals, config) : decideMidTurn(state, signals, config, reason);
+	if (notice === undefined) return decision;
+	return { ...decision, notice: decision.notice ? `${notice}; ${decision.notice}` : notice };
+}
+
 export interface QuotaFailoverInput {
 	state: RoutedState | undefined;
 	/** Model whose reply ended the turn with an error. */
@@ -270,7 +304,7 @@ export interface QuotaFailoverInput {
 }
 
 /**
- * Spec §4.5: pi retries only transient errors, so a usage limit it does not retry ends the turn. The
+ * pi retries only transient errors, so a usage limit it does not retry ends the turn. The
  * settle hook cools the provider down and retries the turn, but only when a usable model remains.
  */
 export function planQuotaFailover(
@@ -299,9 +333,8 @@ export function decide(state: RoutedState | undefined, signals: Signals, config:
 		case "user":
 			return decideUser(state, signals, config);
 		case "continuation":
-		case "direct":
-			return decideMidTurn(state, signals, config, signals.reason);
 		case "retry":
-			return decideRetry(state, signals, config);
+		case "direct":
+			return decideChecked(state, signals, config, signals.reason);
 	}
 }

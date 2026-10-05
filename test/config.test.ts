@@ -71,6 +71,8 @@ test("validation rejects bad values", () => {
 		{ sensitivePaths: ["relative/dir/**"] },
 		{ ollama: { baseUrl: "http://gpu-box.lan:11434" } },
 		{ lockedToolAllowlist: "read" },
+		{ quotaCooldownMinutes: 0 },
+		{ quotaCooldownMinutes: 0.5 },
 		// 0.1 keys are still validated before translation.
 		{ lanes: { claude: "no-slash" } },
 		{ defaultLane: "local" },
@@ -80,7 +82,7 @@ test("validation rejects bad values", () => {
 	for (const raw of cases) assert.equal(parseConfig(raw).ok, false, JSON.stringify(raw));
 });
 
-test("a 0.1 config is translated to 0.2 (spec §3)", () => {
+test("a 0.1 config is translated to 0.2 keys", () => {
 	const result = parseConfig({
 		lanes: { claude: OPUS, local: "ollama/llama3" },
 		defaultLane: "gpt",
@@ -164,4 +166,24 @@ test("a partial routes override that keeps the default code list keeps the defau
 	const result = parseConfig({ routes: { live: [GEMINI, GPT] } });
 	assert.ok(result.ok);
 	assert.equal(result.config.defaultModel, SONNET);
+});
+
+test("private and the classifier model must not run on Ollama's cloud", () => {
+	for (const id of ["gpt-oss:120b-cloud", "qwen3-coder:480b:cloud", "GLM-4.6:CLOUD", "kimi-k2-CLOUD"]) {
+		const priv = parseConfig({ private: `ollama/${id}` });
+		assert.ok(!priv.ok, id);
+		assert.match(priv.error, /private ollama\/.+ runs on Ollama's cloud; use a local model/);
+		const classifier = parseConfig({ ollama: { classifierModel: id } });
+		assert.ok(!classifier.ok, id);
+		assert.match(classifier.error, /ollama\.classifierModel .+ runs on Ollama's cloud; use a local model/);
+	}
+	assert.ok(parseConfig({ private: "ollama/llama3:8b", ollama: { classifierModel: "qwen3:8b" } }).ok);
+	assert.ok(parseConfig({ private: "ollama/cloudy-model:7b" }).ok);
+});
+
+test("quotaCooldownMinutes of 1 is accepted, below 1 is rejected with a message", () => {
+	assert.ok(parseConfig({ quotaCooldownMinutes: 1 }).ok);
+	const result = parseConfig({ quotaCooldownMinutes: 0 });
+	assert.ok(!result.ok);
+	assert.match(result.error, /quotaCooldownMinutes must be >= 1/);
 });

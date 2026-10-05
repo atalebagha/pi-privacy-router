@@ -99,7 +99,7 @@ test("upgradeState: an unlocked 0.1 state becomes a model and a route", () => {
 	});
 });
 
-test("upgradeState keeps the lock on every path (spec §5)", () => {
+test("upgradeState keeps the lock on every path, from 0.1 or 0.2 state", () => {
 	const lock = { locked: true, lockReason: "pii" as const, lockDetail: "x" };
 	for (const stored of [
 		{ lane: "local", ...lock },

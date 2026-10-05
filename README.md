@@ -17,7 +17,7 @@ When a provider hits its plan's usage limit (for example Anthropic's "You're out
 
 ## Requirements
 
-- pi 0.99.1 or later
+- pi 0.99.1 or later (tested on 1.0.2; the package accepts `>=0.99.1 <1.1.0`)
 - [Ollama](https://ollama.com) running locally
 - Credentials in pi (`/login`) for the models in your routes; unusable ones are reported at startup and skipped
 - RAM for the local models: the defaults (`qwen3:8b` classifier plus the 35B worker) need about 30 GB free; on smaller machines use a smaller local worker (see [Memory](#memory))
@@ -28,7 +28,8 @@ When a provider hits its plan's usage limit (for example Anthropic's "You're out
 ollama pull qwen3:8b                 # classifier
 ollama pull qwen3.6:35b              # local worker for private sessions
 ollama create qwen3.6:35b-pi -f ollama/Modelfile.qwen3.6-35b-pi   # same model with a 64k context
-pi install git:github.com/atalebagha/pi-privacy-router
+pi install npm:pi-privacy-router@0.2.1
+# alternative, from git: pi install git:github.com/atalebagha/pi-privacy-router
 pi --model privacy-router/auto
 ```
 
@@ -63,18 +64,31 @@ The router needs the local worker registered with pi. Create `~/.pi/agent/models
 
 A session locks to the local model, permanently, when any of these happen:
 
-- you type `#private` anywhere in a message, or run `/local`
+- you type `#private` anywhere in a message sent through the router, or run `/local`. With a cloud model selected directly, `#private` does nothing: that model receives the message
 - pi starts inside, or your message names, a path in `sensitivePaths`
-- a message or a tool result contains a secret (API keys, tokens, private keys, JWTs, `password=…`)
-- the local classifier says a message contains personal information (health, money, IDs, legal matters, family, relationships)
+- a message or a tool result contains a secret: provider key formats, private keys, JWTs, `scheme://user:pass@host` URLs with a real-looking password, and `password=` / `token:`-style assignments, the last only when the value is 16+ characters with a digit and enough randomness. To avoid false alarms on documentation examples, some values are not flagged: any value that looks like a placeholder (`example`, `changeme`, `your_`, `xxx`, `<…>`), assignment values and URL passwords containing dummy, sample, test, fake or mock, and URL passwords containing pass or secret. A real secret containing such a word is missed
+- the local classifier says the text contains personal information (health, money, IDs, legal matters, family, relationships)
 
-If the session was already long when it locked, the history will not fit the local model's window. The cloud model that wrote the last reply then summarizes the history up to that reply, which it had already received with every request. Your message that triggered the lock, and everything after it, stays local and is kept word for word. If that model is unavailable, a local note of your earlier requests takes the history's place.
+If the session was already long when it locked, the history will not fit the local model's window. The cloud model that wrote the last reply then summarizes the history up to that reply, which it had already received with every request. Your message that triggered the lock, and everything after it, stays local and is kept word for word. If that model is unavailable, a local note of your earlier requests takes the history's place. When the lock is decided while pi is already summarizing (compaction or a `/tree` summary), the local model summarizes everything itself, and a long session can exceed its context until pi compacts again.
 
-Once locked, only local tools run (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `todo`, `ask_user_question`), switching to a cloud model with `/model` is reverted, and prompt-cache warming stops. A session never unlocks in place: every request carries the whole conversation, so unlocking would send the private part on the next message. To use cloud models again, run `/leave-local` (below) or start a new session.
+Once locked, only local tools run (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `todo`, `ask_user_question`) and prompt-cache warming stops. A locked session may only use the router, or your configured `private` model while pi serves it from localhost:
 
-On a cloud model, reads of private paths and secret files (`.env`, `*.pem`, `id_*`, `auth.json`, …) are blocked before they happen.
+- Opening it with another model selected (`pi --model`, `/resume`, `/fork`, `/tree`, `/local`) switches it to `privacy-router/auto` (or, if the router is missing, to the `private` model when the lock allows it). If that switch fails, the model stays and its requests are blocked.
+- Requests from it to any other model get an empty body: pi still makes the HTTP request, with your credentials, but no session content is sent. This holds for providers that build the request through pi's payload hook, as all of pi's built-in providers do; a provider added by another extension that ignores the hook is not covered.
+- `/compact` and `/tree` summaries with another model are cancelled.
+- In a locked session, choosing any other model with `/model` is switched back, and a running turn is stopped. If no allowed model is available to switch to, the choice stays and its requests are blocked.
 
-If Ollama is not running, messages are **refused**, not sent to the cloud unchecked. Set `"onPrivacyCheckFailure": "warn"` to trade that for availability.
+A session never unlocks in place: every request carries the whole conversation, so unlocking would send the private part on the next message. To use cloud models again, run `/leave-local` (below) or start a new session.
+
+While `privacy-router/auto` is selected in an unlocked session, reads of private paths and secret files (`.env`, `*.pem`, `id_*`, `auth.json`, …) are blocked before they happen. The built-in `read`, `write`, `edit`, `ls`, `grep` and `find` are checked against real paths (symlinks resolved). For `bash` the check is a best-effort scan of the command text, and shell tricks can evade it.
+
+### What is checked for personal information
+
+The check covers the session's text since the last cloud reply, not only your newest message: on new turns, on turns that extensions start, on pi's automatic retries, and on summaries (compaction, `/tree`, `/bug`). It reads windows of 4,000 characters; a long message costs up to 16 classifier calls, a few seconds. Text over about 61,000 characters is refused, or passes with a warning under `"onPrivacyCheckFailure": "warn"`. Refused text stays in the session, so the next messages are refused too: add `#private` to keep the session on the local model, use `/tree` without a summary to go back to before the long text, or start a new session. The window includes text written while a local model was selected, so switching back to the router after a long local-only stretch can be refused the same way.
+
+If the classifier does not answer (not running, still loading, or too slow), new messages, turns that extensions start, retries and summaries are **refused**, not sent to the cloud unchecked. Set `"onPrivacyCheckFailure": "warn"` to trade that for availability.
+
+If `HTTP_PROXY` / `HTTPS_PROXY` are set, also set `NO_PROXY=localhost,127.0.0.1,::1`; otherwise classifier and local-model traffic can pass through the proxy.
 
 ## Memory
 
@@ -119,11 +133,11 @@ Every key is optional; missing keys use the defaults in `src/config.ts`, and `ro
 ```
 
 - `routes.code` / `routes.live`: models in failover order, from any providers pi supports. `routes.general`: `"stay"` keeps the current model; a list routes confident general messages to it.
-- `private`: the local model for locked sessions; it must be served from localhost.
+- `private`: the local model for locked sessions. It must really run locally: a model served from localhost must not forward elsewhere. Ollama `-cloud` / `:cloud` models and local gateways (for example LiteLLM) listen on localhost but forward to other servers; `-cloud` models are rejected, and gateways are not supported.
 - `defaultModel`: used before any model has answered and first in the fallback chain; when omitted it defaults to the first `routes.code` model.
 - `pins`: `/route <name>` pins that model until `/route auto`.
 
-Add your own private folders to `sensitivePaths` (for example `"~/Documents/**"`). `ollama.baseUrl` must be a localhost URL: the classifier reads your private text.
+Add your own private folders to `sensitivePaths` (for example `"~/Documents/**"`). `ollama.baseUrl` must be a localhost URL and `ollama.classifierModel` a local model (not `-cloud`): the classifier reads your private text. `quotaCooldownMinutes` must be at least 1.
 
 If you change `classifierModel`, run `npm run eval` from a clone of this repository first: the gates (category accuracy >= 90 %, no code/live misroutes, personal-information recall >= 95 %) are only verified for `qwen3:8b`.
 
@@ -133,16 +147,22 @@ If you change `classifierModel`, run `npm run eval` from a clone of this reposit
 
 ## Known gaps
 
-1. Tool results are checked for secrets and paths, not for personal information.
+1. Tool results are checked for secrets only, not for paths or personal information.
 2. The personal-information classifier is best-effort. `npm run eval` reports 100 % recall on 44 cases, but those cases also guided the prompt, so real-world recall is lower; `#private` and `/local` are the guarantees.
 3. Images are not scanned.
-4. `bash` still works in private sessions and can reach the network; the threat model is "never send to an AI provider", not "contain a hostile model".
+4. `bash` still works in private sessions and can reach the network; the threat model is "never send to an AI provider", not "contain a hostile model". It can also edit the router's config and session files, so the lock is only as trustworthy as the local model and the files it reads. Adding network tools to `lockedToolAllowlist` weakens the lock.
 5. Subagents already running when a session locks are not stopped; new subagent calls are blocked.
-6. Observability extensions may upload prompts and responses to their own service; configure them to send metadata only.
+6. Logging or sync extensions, for example Langfuse tracing or session mirroring, receive what pi sends them, including locked content. The router cannot stop them; remove them or keep them off privacy work.
 7. Runs with extensions disabled are not protected.
 8. A locked session whose *private* part alone outgrows the local model (for example a pasted document larger than the window) still cannot be summarized; start a new session.
 9. The lock-time handoff assumes every request carried the branch as pi projects it. An extension that strips messages from requests is safe only if it also filters pi's compaction input and loads before this router.
-10. Do not install it next to another extension that registers `/local`, `/leave-local`, `/route` or `/privacy`.
+10. Content that other extensions add to requests after routing (pi context hooks) is not scanned.
+11. `/share`, `/export` and pi's bug report (`/bug`, which also asks the selected model to summarize the session) include locked branches.
+12. The path guard runs only while `privacy-router/auto` is selected in an unlocked session. A cloud model selected directly gets no guard, and in a locked session the path guard does not run; only the tool allowlist applies.
+13. Only the built-in file tools and `bash` are inspected; non-built-in tools (MCP, custom tools) are never checked for private paths.
+14. Do not install it next to another extension that registers `/local`, `/leave-local`, `/route` or `/privacy`.
+15. A locked session's emptied request body stays empty only if no extension loaded after the router rebuilds the request in its own `before_provider_request` handler.
+16. Text you type as instructions to `/compact`, to a `/tree` summary, or as a `/bug` description goes to the summarizing model unchecked. Keep personal information out of it, or add `#private` to the session first.
 
 ## Development
 

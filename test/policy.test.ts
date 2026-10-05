@@ -338,3 +338,72 @@ test("a zero cooldown never fails over to the failed provider itself", () => {
 	assert.deepEqual(retry.target, { kind: "failed" });
 	assert.equal(retry.why, "retry (no failover model)");
 });
+
+// Batch D: retries can carry queued steering messages, summaries (direct) can carry text a refused turn
+// left behind, and continuations can carry text an extension added, so all three get the privacy check
+// on the text since the last cloud reply.
+const warn = { ...config, onPrivacyCheckFailure: "warn" as const };
+const midTurn = [
+	["retry", { reason: "retry", previous: SONNET, failed: SONNET }],
+	["direct", { reason: "direct", previous: SONNET }],
+	["continuation", { reason: "continuation", previous: SONNET }],
+] as const;
+
+function refusalOf(run: () => unknown): string {
+	try {
+		run();
+	} catch (error) {
+		if (error instanceof RouterError) return error.message;
+		throw error;
+	}
+	assert.fail("no refusal");
+}
+
+test("retry, direct and continuation requests lock on personal information, like user turns", () => {
+	for (const [name, base] of midTurn) {
+		const d = decide(onSonnet, signals({ ...base, pii: "yes" }), config);
+		assert.deepEqual(d.target, { kind: "private" }, name);
+		assert.equal(d.state?.locked, true, name);
+		assert.equal(d.state?.lockReason, "pii", name);
+	}
+});
+
+test("retry, direct and continuation requests whose text could not be checked are refused in block mode, as user turns are", () => {
+	for (const [name, base] of midTurn) {
+		for (const pii of ["error", "too-long"] as const) {
+			const userRefusal = refusalOf(() => decide(onSonnet, signals({ pii }), config));
+			assert.equal(
+				refusalOf(() => decide(onSonnet, signals({ ...base, pii }), config)),
+				userRefusal,
+				`${name} ${pii}`,
+			);
+		}
+	}
+});
+
+test("retry, direct and continuation requests whose text could not be checked route on with the user turn's notice in warn mode", () => {
+	for (const [name, base] of midTurn) {
+		for (const pii of ["error", "too-long"] as const) {
+			const userNotice = decide(onSonnet, signals({ pii }), warn).notice;
+			assert.ok(userNotice?.startsWith("⚠"), pii);
+			const d = decide(onSonnet, signals({ ...base, pii }), warn);
+			assert.deepEqual(d.target, decide(onSonnet, signals({ ...base, pii: undefined }), warn).target, `${name} ${pii}`);
+			assert.equal(d.notice, userNotice, `${name} ${pii}`);
+		}
+	}
+	const failover = decide(onSonnet, signals({ ...midTurn[0][1], failedIsQuota: true, pii: "error" }), warn);
+	assert.deepEqual(failover.target, model(GPT));
+	assert.match(failover.notice ?? "", /^⚠ privacy check unavailable; deterministic checks only; anthropic usage limit/);
+});
+
+test("a clean or absent privacy check leaves retry, direct and continuation routing as it was, quota failover included", () => {
+	for (const pii of ["no", undefined] as const) {
+		const failover = decide(onSonnet, signals({ ...midTurn[0][1], failedIsQuota: true, pii }), config);
+		assert.deepEqual(failover.target, model(GPT));
+		assert.equal(failover.state?.cooldowns?.anthropic, HOUR);
+		assert.deepEqual(decide(onSonnet, signals({ ...midTurn[0][1], pii }), config).target, { kind: "failed" });
+		assert.deepEqual(decide(onSonnet, signals({ ...midTurn[1][1], pii }), config).target, { kind: "previous" });
+		assert.equal(decide(onSonnet, signals({ ...midTurn[1][1], pii }), config).notice, undefined);
+		assert.deepEqual(decide(onSonnet, signals({ ...midTurn[2][1], pii }), config).target, { kind: "previous" });
+	}
+});

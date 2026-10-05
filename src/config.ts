@@ -3,7 +3,7 @@
  *
  * An absent file means built-in defaults. A present but invalid file is an error: silently
  * ignoring it could drop the user's `sensitivePaths`. A 0.1 file (`lanes`, `defaultLane`,
- * `pinTargets`) is translated to 0.2 keys when it loads (spec §3).
+ * `pinTargets`) is translated to 0.2 keys when it loads.
  */
 
 import { readFileSync } from "node:fs";
@@ -119,7 +119,7 @@ function isModelRef(value: unknown): value is string {
 	return typeof value === "string" && MODEL_REF.test(value);
 }
 
-/** Spec §3: 0.1 routing keys as 0.2 keys. Missing 0.1 keys take 0.1 defaults first. */
+/** 0.1 routing keys as 0.2 keys. Missing 0.1 keys take 0.1 defaults first. */
 function translateLegacy(raw: Record<string, unknown>): { routing: Partial<RouterConfig>; errors: string[] } {
 	const errors: string[] = [];
 	const lanes: Record<string, unknown> = { ...LEGACY_DEFAULT_LANES, ...(isObject(raw.lanes) ? raw.lanes : {}) };
@@ -223,6 +223,9 @@ function validate(config: RouterConfig): string[] {
 		}
 	}
 	if (!isModelRef(config.private)) errors.push(`private must be "provider/model"`);
+	else if (isOllamaCloudModel(splitRef(config.private).id)) {
+		errors.push(`private ${config.private} runs on Ollama's cloud; use a local model`);
+	}
 	if (!isModelRef(config.defaultModel)) errors.push(`defaultModel must be "provider/model"`);
 	if (!isObject(config.pins)) {
 		errors.push("pins must be an object");
@@ -235,8 +238,8 @@ function validate(config: RouterConfig): string[] {
 	if (typeof config.minProb !== "number" || config.minProb < 0 || config.minProb > 1) {
 		errors.push("minProb must be between 0 and 1");
 	}
-	if (typeof config.quotaCooldownMinutes !== "number" || config.quotaCooldownMinutes < 0) {
-		errors.push("quotaCooldownMinutes must be >= 0");
+	if (typeof config.quotaCooldownMinutes !== "number" || config.quotaCooldownMinutes < 1) {
+		errors.push("quotaCooldownMinutes must be >= 1");
 	}
 	if (config.onPrivacyCheckFailure !== "block" && config.onPrivacyCheckFailure !== "warn") {
 		errors.push(`onPrivacyCheckFailure must be "block" or "warn"`);
@@ -255,10 +258,18 @@ function validate(config: RouterConfig): string[] {
 	if (!isLoopbackUrl(config.ollama.baseUrl)) {
 		errors.push("ollama.baseUrl must be a localhost URL (classifier input is private text)");
 	}
+	if (typeof config.ollama.classifierModel === "string" && isOllamaCloudModel(config.ollama.classifierModel)) {
+		errors.push(`ollama.classifierModel ${config.ollama.classifierModel} runs on Ollama's cloud; use a local model`);
+	}
 	if (typeof config.ollama.timeoutMs !== "number" || config.ollama.timeoutMs <= 0) {
 		errors.push("ollama.timeoutMs must be > 0");
 	}
 	return errors;
+}
+
+/** Ollama serves `-cloud` / `:cloud` models from its own cloud although the request goes to localhost. */
+function isOllamaCloudModel(id: string): boolean {
+	return /[-:]cloud$/i.test(id);
 }
 
 export function isLoopbackUrl(url: string): boolean {

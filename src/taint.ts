@@ -23,6 +23,12 @@ export interface SecretPattern {
 /** Real provider keys are random base62: digits plus both letter cases. `sk-cube-grid-animation` is not. */
 const looksRandom = (value: string): boolean => /\d/.test(value) && /[a-z]/.test(value) && /[A-Z]/.test(value);
 
+const URL_PASSWORD_WORDS = /pass|secret|example|changeme|dummy|sample|test|fake|mock/i;
+
+/** A password in a URL counts only when it has the shape of a real one: 8+ characters, a digit and a letter, no filler words. */
+const urlPasswordLooksReal = (value: string): boolean =>
+	value.length >= 8 && /\d/.test(value) && /[A-Za-z]/.test(value) && !URL_PASSWORD_WORDS.test(value);
+
 /** Order matters: the first pattern with a real match names the hit (`sk-ant-` before `sk-`). */
 export const SECRET_PATTERNS: readonly SecretPattern[] = [
 	{ name: "private-key-block", re: /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/g },
@@ -41,9 +47,16 @@ export const SECRET_PATTERNS: readonly SecretPattern[] = [
 	{ name: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g },
 	{ name: "jwt", re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
 	{
+		name: "url-credentials",
+		// scheme://user:password@host; the quantifiers are bounded so long text cannot make the scan slow.
+		re: /\b[a-z][a-z0-9+.-]{0,20}:\/\/[^\s:/@]{1,100}:([^\s@/]{1,256})@/gi,
+		group: 1,
+		check: urlPasswordLooksReal,
+	},
+	{
 		name: "generic-assignment",
 		// No leading \b: keywords sit inside identifiers like DB_PASSWORD and client_secret.
-		re: /(?:secret|token|password|passwd|api[_-]?key)\w*["']?\s*[:=]\s*["']?([^\s"'`,;)]{16,})/gi,
+		re: /(?:secret|token|password|passwd|api[_-]?key)\w{0,40}["']?\s*[:=]\s*["']?([^\s"'`,;)]{16,})/gi,
 		group: 1,
 		generic: true,
 	},

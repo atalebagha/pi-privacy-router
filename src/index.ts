@@ -21,13 +21,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	CATEGORIES,
+	type Category,
 	categoryPrompt,
 	isAcknowledgement,
 	type Labeled,
+	MAX_PII_WINDOWS,
 	PII_LABELS,
-	type Category,
 	parseLabel,
 	piiPrompt,
+	piiWindows,
 } from "./classify.ts";
 import { configPath, isLoopbackUrl, loadConfig, type RouterConfig, splitRef } from "./config.ts";
 import {
@@ -54,9 +56,9 @@ import {
 	COMMAND_ENTRY,
 	firstLockIndex,
 	isLocked,
-	type RouterCommand,
 	ROUTER_MODEL_ID,
 	ROUTER_PROVIDER,
+	type RouterCommand,
 	readCommands,
 	readRouterState,
 } from "./state.ts";
@@ -69,7 +71,8 @@ import {
 	toolPathHit,
 } from "./taint.ts";
 
-const HOME = homedir();
+// Real path of the home directory, so a symlinked home still matches sensitive paths (paths are checked as real paths).
+const HOME = safeRealpath(homedir());
 const PATH_BLOCK_REASON = "Blocked: this path is private. Ask the user to run /local to work on it.";
 const SEARCH_BLOCK_REASON =
 	"Blocked: this search would reach private folders. Narrow the path to a project folder, or ask the user to run /local.";
@@ -82,14 +85,23 @@ function textOf(content: string | readonly TextBlock[]): string {
 }
 
 /**
- * User-authored text and tool output since the latest *successful* assistant message: what this
- * request adds. Failed or aborted replies (including a refused route) do not count, so a message
- * whose privacy check failed is checked again on the next turn instead of riding along unchecked.
+ * User-authored text and tool output since the latest *successful cloud* assistant message: what a
+ * cloud model has not yet seen. Replies from a local model do not anchor, so text written while one
+ * was selected is scanned before the router sends it to a cloud model. Failed or aborted replies
+ * (including a refused route) do not anchor either, so a message whose privacy check failed is
+ * checked again on the next turn instead of riding along unchecked.
  */
-export function deltaText(messages: readonly Message[]): { user: string; tool: string } {
+export function deltaText(
+	messages: readonly Message[],
+	isCloud: (provider: string, model: string) => boolean,
+): { user: string; tool: string } {
 	const start =
 		messages.findLastIndex(
-			(message) => message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted",
+			(message) =>
+				message.role === "assistant" &&
+				message.stopReason !== "error" &&
+				message.stopReason !== "aborted" &&
+				isCloud(message.provider, message.model),
 		) + 1;
 	const user: string[] = [];
 	const tool: string[] = [];
@@ -154,6 +166,40 @@ function usingRouter(ctx: ExtensionContext): boolean {
 	return ctx.model?.provider === ROUTER_PROVIDER && ctx.model.id === ROUTER_MODEL_ID;
 }
 
+type ModelRef = { provider: string; id: string };
+
+/**
+ * What a locked session may talk to: the router (which decides per request) or the configured
+ * private model, when pi serves it from localhost (as privateModel() requires). Not "anything on
+ * localhost": Ollama -cloud models and local gateways listen on loopback but run remotely. An
+ * invalid config leaves only the router.
+ */
+function lockAllowsModel(model: ModelRef, ctx: ExtensionContext): boolean {
+	if (model.provider === ROUTER_PROVIDER && model.id === ROUTER_MODEL_ID) return true;
+	const loaded = loadConfig();
+	if (!loaded.ok) return false;
+	const { provider, id } = splitRef(loaded.config.private);
+	if (model.provider !== provider || model.id !== id) return false;
+	const found = ctx.modelRegistry.find(provider, id);
+	return found !== undefined && isLoopbackUrl(found.baseUrl);
+}
+
+const refOf = (model: ModelRef) => `${model.provider}/${model.id}`;
+
+const blockedNotice = (model: ModelRef) =>
+	`🔒 This session is locked to local; requests to ${refOf(model)} will be blocked.`;
+
+/** Where a locked session switches from a model it may not use: the router, else the private model if the lock allows it. */
+function lockFallback(ctx: ExtensionContext) {
+	const router = ctx.modelRegistry.find(ROUTER_PROVIDER, ROUTER_MODEL_ID);
+	if (router) return router;
+	const loaded = loadConfig();
+	if (!loaded.ok) return undefined;
+	const { provider, id } = splitRef(loaded.config.private);
+	const local = ctx.modelRegistry.find(provider, id);
+	return local && lockAllowsModel(local, ctx) ? local : undefined;
+}
+
 function registryModel(ref: string, ctx: ExtensionContext) {
 	const { provider, id } = splitRef(ref);
 	const model = ctx.modelRegistry.find(provider, id);
@@ -170,7 +216,7 @@ function privateModel(config: RouterConfig, ctx: ExtensionContext) {
 	return model;
 }
 
-/** Spec §4.2: whether pi has the model and credentials for it. */
+/** Whether pi has the model and credentials for it. */
 function availabilityIn(ctx: ExtensionContext): (ref: string) => Availability {
 	return (ref) => {
 		const { provider, id } = splitRef(ref);
@@ -194,11 +240,26 @@ async function classifyCategory(config: RouterConfig, text: string, signal?: Abo
 	return parsed;
 }
 
-async function classifyPii(config: RouterConfig, text: string, signal?: AbortSignal): Promise<"yes" | "no"> {
-	const output = await askOneWord(ollamaOptions(config), piiPrompt(text), signal);
-	const parsed = parseLabel(output.content, output.logprob, PII_LABELS);
-	if (!parsed) throw new Error(`unexpected privacy output ${JSON.stringify(output.content)}`);
-	return parsed.label;
+/** "too-long" past the window cap; otherwise the privacy classifier's verdict on every window. */
+async function checkPii(config: RouterConfig, text: string, signal?: AbortSignal): Promise<"yes" | "no" | "too-long"> {
+	const windows = piiWindows(text);
+	if (windows.length > MAX_PII_WINDOWS) return "too-long";
+	return classifyPii(config, windows, signal);
+}
+
+/** Reads every window in order and stops at the first "yes"; any error fails the whole check. */
+async function classifyPii(
+	config: RouterConfig,
+	windows: readonly string[],
+	signal?: AbortSignal,
+): Promise<"yes" | "no"> {
+	for (const window of windows) {
+		const output = await askOneWord(ollamaOptions(config), piiPrompt(window), signal);
+		const parsed = parseLabel(output.content, output.logprob, PII_LABELS);
+		if (!parsed) throw new Error(`unexpected privacy output ${JSON.stringify(output.content)}`);
+		if (parsed.label === "yes") return "yes";
+	}
+	return "no";
 }
 
 function footerText(decision: Decision): string | undefined {
@@ -233,7 +294,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 	let lastDecision = "none";
 	let classifierHealth = "not used yet";
 	let defaultsNoticeShown = false;
-	/** Spec §4.4: each model skipped for missing credentials is announced once per session. */
+	/** Each model skipped for missing credentials is announced once per session. */
 	const skipNotices = new Set<string>();
 
 	function restrictTools(config: RouterConfig): void {
@@ -259,6 +320,27 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			if (loaded.ok) restrictTools(loaded.config);
 		} else {
 			restoreTools();
+		}
+	}
+
+	/** The branch is locked (or unreadable) and the selected model is one the lock does not allow. */
+	function lockedOnForeignModel(ctx: ExtensionContext, branch: readonly BranchEntry[] | undefined): boolean {
+		if (!ctx.model || lockAllowsModel(ctx.model, ctx)) return false;
+		return branch === undefined || isLocked(branch);
+	}
+
+	/** Switches a locked session off a model it may not use, to the router (else an allowed private model). */
+	async function enforceLockedModel(ctx: ExtensionContext): Promise<void> {
+		if (!lockedOnForeignModel(ctx, readBranch(ctx)) || !ctx.model) return;
+		const from = ctx.model;
+		const target = lockFallback(ctx);
+		const switched = target !== undefined && (await pi.setModel(target));
+		if (!ctx.hasUI) return;
+		if (switched) {
+			ctx.ui.notify(`🔒 This session is locked to local; switched from ${refOf(from)} to ${refOf(target)}.`, "warning");
+		} else {
+			// The before_provider_request backstop keeps blocking requests to this model.
+			ctx.ui.notify(blockedNotice(from), "error");
 		}
 	}
 
@@ -313,6 +395,12 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		id: ROUTER_MODEL_ID,
 		name: "Auto (router)",
 		thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+		// After the first response pi uses the limits of the model that answered; these count only
+		// before then and after a refused route, which leaves the router on the last assistant message.
+		// Unset, they are 0, and every refusal would trigger a threshold compaction (a cloud summary
+		// call). A real overflow on a smaller model still compacts through pi's overflow recovery.
+		contextWindow: 200_000,
+		maxTokens: 32_000,
 		async route(request, ctx) {
 			const startedAt = Date.now();
 			const config = requireConfig();
@@ -323,15 +411,22 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 				commands.cooldowns,
 				config,
 			);
-			const delta = deltaText(request.messages);
+			const delta = deltaText(request.messages, (provider, id) => {
+				if (provider === ROUTER_PROVIDER) return false;
+				const model = ctx.modelRegistry.find(provider, id);
+				return model !== undefined && !isLoopbackUrl(model.baseUrl);
+			});
 			const policy = pathPolicy(config, ctx.cwd);
 			const secretInUser = findSecret(delta.user);
 			const secretInTool = secretInUser ? undefined : findSecret(delta.tool);
 			// A pin whose name left the config is ignored.
-			const pin = commands.pin === undefined ? undefined : config.pins[commands.pin];
+			const pin =
+				commands.pin !== undefined && Object.hasOwn(config.pins, commands.pin) ? config.pins[commands.pin] : undefined;
 
 			const signals: Signals = {
-				reason: request.reason,
+				// pi retries a routing refusal it considers transient as "retry" with no failed model. The
+				// refused turn must get every check again, so it counts as a new user turn.
+				reason: request.reason === "retry" && request.failed === undefined ? "user" : request.reason,
 				branchReadable: branch !== undefined,
 				lockRequested: commands.lockRequested,
 				cwdSensitive: isSensitivePath(safeRealpath(ctx.cwd), config.sensitivePaths, HOME),
@@ -353,23 +448,43 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 
 			if (needsClassification(state, signals)) {
 				if (delta.user.trim() === "") {
-					// Image-only or empty message: nothing for the classifiers to read (spec §11 gap 3).
+					// Image-only or empty message: nothing for the classifiers to read (images are not scanned).
 					signals.pii = "no";
 					signals.category = { label: "general", p: 1 };
 				} else {
 					const [pii, category] = await Promise.allSettled([
-						classifyPii(config, delta.user, request.signal),
+						checkPii(config, delta.user, request.signal),
 						// A bare "ok, continue" carries no new task: keep the current model (the privacy check still runs).
 						isAcknowledgement(delta.user)
 							? Promise.resolve<Labeled<Category>>({ label: "general", p: 1 })
 							: classifyCategory(config, delta.user, request.signal),
 					]);
 					signals.pii = pii.status === "fulfilled" ? pii.value : "error";
+					signals.piiLength = delta.user.length;
 					signals.category = category.status === "fulfilled" ? category.value : "error";
 					const failure = [pii, category].find((result) => result.status === "rejected");
 					classifierHealth = failure
 						? `down: ${String((failure as PromiseRejectedResult).reason)}`
 						: `ok · ${Date.now() - startedAt} ms`;
+				}
+			} else if (
+				signals.reason !== "user" &&
+				needsClassification(state, { ...signals, reason: "user" }) &&
+				delta.user.trim() !== ""
+			) {
+				// Every other request gets the privacy check (no category) on new user-side text: a retry can
+				// carry steering queued during the failed request, a summary text a refused turn left behind,
+				// and a continuation text an extension added when it started the turn. A tool loop has none.
+				// A summary that locks here comes after session_before_compact, so the late-lock handoff does
+				// not run: the local model summarizes everything, and a long session can overflow it until
+				// pi compacts again.
+				signals.piiLength = delta.user.length;
+				try {
+					signals.pii = await checkPii(config, delta.user, request.signal);
+					classifierHealth = `ok · ${Date.now() - startedAt} ms`;
+				} catch (error) {
+					signals.pii = "error";
+					classifierHealth = `down: ${String(error)}`;
 				}
 			}
 
@@ -391,6 +506,8 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 
 	pi.on("session_start", async (_event, ctx) => {
 		syncTools(ctx);
+		// pi emits no model_select on restore, so a reopened locked session may already sit on a cloud model.
+		await enforceLockedModel(ctx);
 		if (!usingRouter(ctx)) return;
 		const loaded = loadConfig();
 		if (!loaded.ok) {
@@ -430,10 +547,52 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			}
 		}
 		syncTools(ctx);
+		await enforceLockedModel(ctx);
+	});
+
+	pi.on("before_provider_request", async (_event, ctx) => {
+		// Backstop at the provider boundary for agent turns and cache-warming requests. Compaction and
+		// /tree summaries do not pass through this hook in pi; session_before_compact and
+		// session_before_tree cover them. pi swallows errors thrown in this hook (extensions/runner.js
+		// emitBeforeProviderRequest catches them), and the return value replaces the request body, so
+		// emptying the body is the only way to stop the content. With the router selected, ctx.model is
+		// the router and route() decides, so this stays out of the way.
+		if (!lockedOnForeignModel(ctx, readBranch(ctx)) || !ctx.model) return undefined;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`🔒 Blocked a request from a locked session to ${refOf(ctx.model)}; no session content was sent. Select privacy-router/auto.`,
+				"warning",
+			);
+		}
+		return {};
+	});
+
+	pi.on("session_before_tree", async (event, ctx) => {
+		if (!event.preparation.userWantsSummary || !ctx.model) return undefined;
+		const { oldLeafId } = event.preparation;
+		const left = oldLeafId === null ? undefined : readBranchAt(ctx, oldLeafId);
+		if (!lockedOnForeignModel(ctx, left)) return undefined;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`A summary of a private branch would go to ${refOf(ctx.model)}; navigate without a summary or select privacy-router/auto.`,
+				"warning",
+			);
+		}
+		return { cancel: true };
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		// Spec §14 item 9: a session that locks late carries more cloud history than the local model
+		if (isLocked(event.branchEntries) && ctx.model && !lockAllowsModel(ctx.model, ctx)) {
+			// pi would send the summary request to the selected model.
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`🔒 Compaction cancelled: this session is locked to local and ${refOf(ctx.model)} is selected. Select privacy-router/auto.`,
+					"warning",
+				);
+			}
+			return { cancel: true };
+		}
+		// A session that locks late can carry more cloud history than the local model
 		// can summarize. The cloud model that already received that history summarizes it instead.
 		if (!isLocked(event.branchEntries)) return undefined;
 		const loaded = loadConfig();
@@ -585,17 +744,19 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 		if (event.source === "restore" || event.model.provider === ROUTER_PROVIDER) return;
 		const branch = readBranch(ctx);
 		if (branch !== undefined && !isLocked(branch)) return;
-		const loaded = loadConfig();
-		const localRef = loaded.ok ? loaded.config.private : undefined;
-		// Any model served from this machine keeps the session private, not just the configured worker.
-		if (isLoopbackUrl(event.model.baseUrl)) return;
-		const fallback =
-			ctx.modelRegistry.find(ROUTER_PROVIDER, ROUTER_MODEL_ID) ??
-			(localRef ? ctx.modelRegistry.find(splitRef(localRef).provider, splitRef(localRef).id) : undefined);
+		// Only the router and the configured private model: other loopback endpoints may be gateways to the cloud.
+		if (lockAllowsModel(event.model, ctx)) return;
+		const fallback = lockFallback(ctx);
 		// pi has already switched the model; a running turn's next request would reach it before the revert.
 		if (!ctx.isIdle()) ctx.abort();
-		if (fallback) await pi.setModel(fallback);
-		if (ctx.hasUI) ctx.ui.notify("Session is locked to local. Start a new session for cloud models.", "warning");
+		const switched = fallback !== undefined && (await pi.setModel(fallback));
+		if (!ctx.hasUI) return;
+		if (switched) {
+			ctx.ui.notify("Session is locked to local. Start a new session for cloud models.", "warning");
+		} else {
+			// The before_provider_request backstop keeps blocking requests to this model.
+			ctx.ui.notify(blockedNotice(event.model), "error");
+		}
 	});
 
 	pi.on("cache_warming_decision", async (_event, ctx) => {
@@ -616,6 +777,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 			if (loaded.ok) restrictTools(loaded.config);
 			ctx.ui.setStatus("privacy-router", "🔒 local · command");
 			ctx.ui.notify("🔒 Session locked to local. Start a new session to use cloud models again.", "warning");
+			await enforceLockedModel(ctx);
 		},
 	});
 
@@ -689,7 +851,7 @@ export default function router(pi: ExtensionAPI, deps: RouterDeps = defaultDeps)
 				ctx.ui.notify("Routing is automatic again.", "info");
 				return;
 			}
-			if (!(name in loaded.config.pins)) {
+			if (!Object.hasOwn(loaded.config.pins, name)) {
 				const names = [...Object.keys(loaded.config.pins), "auto"].join(", ");
 				ctx.ui.notify(`Usage: /route <${names}>`, "warning");
 				return;

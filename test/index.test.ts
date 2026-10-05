@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import router, { type RouterDeps } from "../src/index.ts";
+import { MAX_CLASSIFY_CHARS, MAX_PII_WINDOWS } from "../src/classify.ts";
+import router, { deltaText, type RouterDeps } from "../src/index.ts";
 import { RouterError } from "../src/policy.ts";
 import { COMMAND_ENTRY, VIRTUAL_MODEL_STATE_ENTRY } from "../src/state.ts";
 
@@ -58,12 +59,19 @@ function harness(catalog: Model[] = models, deps?: RouterDeps, auth: (model: Mod
 	const navigations: { id: string; options: unknown }[] = [];
 	let aborts = 0;
 	let modelSets = 0;
+	let setModelResult = true;
+	let branchBroken = false;
+	let branchAtBroken = false;
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const entries: Entry[] = [];
 	const notices: string[] = [];
 	let virtualModel:
-		| { route: (request: unknown, ctx: unknown) => Promise<{ model: Model; state?: unknown }> }
+		| {
+				contextWindow?: number;
+				maxTokens?: number;
+				route: (request: unknown, ctx: unknown) => Promise<{ model: Model; state?: unknown }>;
+		  }
 		| undefined;
 	let activeTools = ["read", "bash", "edit", "web_search", "askClaude"];
 	let selected: Model | undefined = find("privacy-router", "auto");
@@ -86,9 +94,9 @@ function harness(catalog: Model[] = models, deps?: RouterDeps, auth: (model: Mod
 			activeTools = names;
 		},
 		setModel: async (model: Model) => {
-			selected = model;
+			if (setModelResult) selected = model;
 			modelSets++;
-			return true;
+			return setModelResult;
 		},
 	};
 	router(pi as never, deps);
@@ -102,7 +110,12 @@ function harness(catalog: Model[] = models, deps?: RouterDeps, auth: (model: Mod
 				status = text;
 			},
 		},
-		sessionManager: { getBranch: (fromId?: string) => (fromId && branchAt ? branchAt(fromId) : entries) },
+		sessionManager: {
+			getBranch: (fromId?: string) => {
+				if (fromId ? branchAtBroken : branchBroken) throw new Error("unreadable branch");
+				return fromId && branchAt ? branchAt(fromId) : entries;
+			},
+		},
 		modelRegistry: {
 			find: lookup,
 			hasConfiguredAuth: (model: Model) => auth(model),
@@ -136,11 +149,25 @@ function harness(catalog: Model[] = models, deps?: RouterDeps, auth: (model: Mod
 
 	return {
 		route,
+		virtualModel: () => virtualModel,
 		entries,
 		notices,
 		status: () => status,
 		tools: () => activeTools,
 		selected: () => selected,
+		/** Selects a model the way pi does on startup or resume: no model_select event. */
+		setModelResult: (value: boolean) => {
+			setModelResult = value;
+		},
+		breakBranch: (value: boolean) => {
+			branchBroken = value;
+		},
+		breakBranchAt: (value: boolean) => {
+			branchAtBroken = value;
+		},
+		select: (model: Model | undefined) => {
+			selected = model;
+		},
 		aborts: () => aborts,
 		modelSets: () => modelSets,
 		navigations,
@@ -167,17 +194,28 @@ function harness(catalog: Model[] = models, deps?: RouterDeps, auth: (model: Mod
 	};
 }
 
-let ollama: { category: string; pii: string; down: boolean; calls: string[] };
+let ollama: {
+	category: string;
+	pii: string;
+	/** When set, a privacy prompt is answered "yes" only if its text contains this marker, else "no". */
+	piiMarker?: string;
+	down: boolean;
+	calls: string[];
+	piiCalls: number;
+};
 const realFetch = globalThis.fetch;
 
 beforeEach(() => {
-	ollama = { category: "general", pii: "no", down: false, calls: [] };
+	ollama = { category: "general", pii: "no", piiMarker: undefined, down: false, calls: [], piiCalls: 0 };
 	globalThis.fetch = (async (url: string, init: RequestInit) => {
 		ollama.calls.push(url);
 		if (ollama.down) throw new TypeError("fetch failed");
 		const body = JSON.parse(String(init.body));
 		const isPii = String(body.messages?.[0]?.content ?? "").startsWith("You are a privacy filter");
-		const content = isPii ? ollama.pii : ollama.category;
+		if (isPii) ollama.piiCalls++;
+		const markerHit = String(body.messages?.[1]?.content ?? "").includes(ollama.piiMarker ?? "");
+		const pii = ollama.piiMarker === undefined ? ollama.pii : markerHit ? "yes" : "no";
+		const content = isPii ? pii : ollama.category;
 		return new Response(JSON.stringify({ message: { content }, logprobs: [{ token: content, logprob: 0 }] }));
 	}) as typeof fetch;
 });
@@ -292,6 +330,21 @@ test("/route pins a target and /route auto releases it", async () => {
 	await h.command("route", "auto");
 	const released = await h.route({ reason: "user", messages: [user("weather in Chicago now?")] });
 	assert.equal(released.model.id, "gpt-6-sol");
+});
+
+test("/route constructor shows the usage notice and appends no pin", async () => {
+	const h = harness();
+	await h.command("route", "constructor");
+	assert.ok(h.notices.some((n) => n.startsWith("Usage: /route <")));
+	assert.equal(h.entries.length, 0);
+});
+
+test("a pin command naming constructor routes normally", async () => {
+	const h = harness();
+	ollama.category = "live";
+	h.replaceBranch([{ type: "custom", customType: COMMAND_ENTRY, data: { kind: "pin", target: "constructor" } }]);
+	const result = await h.route({ reason: "user", messages: [user("weather in Chicago now?")] });
+	assert.equal(result.model.id, "gpt-6-sol");
 });
 
 test("an image-only message routes without calling the classifier", async () => {
@@ -436,13 +489,18 @@ test("review M1: resuming a locked session, then /tree to an unlocked point keep
 	assert.deepEqual(h.tools(), ["read", "bash", "edit", "web_search", "askClaude"]);
 });
 
-test("review M3: a locked session may switch to any localhost model", async () => {
+test("a locked session accepts the configured private model and reverts any other model, localhost or not", async () => {
 	const h = harness();
 	await h.command("local");
-	const noticesBefore = h.notices.length;
+	await h.emit("model_select", {
+		type: "model_select",
+		model: find("ollama", "qwen3.6:35b-pi"),
+		source: "set",
+	});
+	assert.equal(h.modelSets(), 0, "the private model is accepted");
 	await h.emit("model_select", { type: "model_select", model: find("ollama", "llama3"), source: "set" });
-	assert.equal(h.modelSets(), 0, "no revert");
-	assert.deepEqual(h.notices.slice(noticesBefore), [], "no 'locked to local' warning for a local model");
+	assert.equal(h.modelSets(), 1, "another localhost model may be a remote gateway; reverted");
+	assert.equal(h.selected()?.provider, "privacy-router");
 });
 
 test("review M4: no classifier warm-up when resuming a locked session", async () => {
@@ -861,4 +919,534 @@ test("a 0.1 gpt cooldown command with a 0.1 unlocked state keeps routing off ope
 	});
 	assert.equal(result.model.id, "claude-sonnet-5");
 	assert.ok(Object.keys((result.state as { cooldowns?: object }).cooldowns ?? {}).includes("openai-codex"));
+});
+
+// Batch A: the lock holds whatever model is selected.
+const CLOUD = () => find("anthropic", "claude-sonnet-5");
+const PRIVATE = () => find("ollama", "qwen3.6:35b-pi");
+
+test("session_start: a locked branch with a cloud model selected switches to the router and says so", async () => {
+	const h = harness();
+	await h.command("local");
+	h.select(CLOUD());
+	const noticesBefore = h.notices.length;
+	await h.emit("session_start", { type: "session_start", reason: "resume" });
+	assert.equal(h.selected()?.provider, "privacy-router");
+	assert.equal(h.modelSets(), 1);
+	assert.deepEqual(h.notices.slice(noticesBefore), [
+		"🔒 This session is locked to local; switched from anthropic/claude-sonnet-5 to privacy-router/auto.",
+	]);
+});
+
+test("session_start: unlocked with a cloud model, or locked with the private model, is left alone", async () => {
+	const h = harness();
+	h.select(CLOUD());
+	await h.emit("session_start", { type: "session_start", reason: "startup" });
+	assert.equal(h.modelSets(), 0);
+	h.replaceBranch([lockEntry]);
+	h.select(PRIVATE());
+	await h.emit("session_start", { type: "session_start", reason: "resume" });
+	assert.equal(h.modelSets(), 0);
+});
+
+test("session_tree: arriving in a locked branch with a cloud model selected switches to the router", async () => {
+	const h = harness();
+	await h.command("local");
+	h.select(CLOUD());
+	await h.emit("session_tree", { type: "session_tree", newLeafId: "leaf", oldLeafId: null });
+	assert.equal(h.selected()?.provider, "privacy-router");
+	assert.equal(h.modelSets(), 1);
+	assert.match(h.notices.at(-1) ?? "", /switched from anthropic\/claude-sonnet-5 to privacy-router\/auto/);
+});
+
+test("before_provider_request: a locked session with a cloud model gets an empty body and a notice", async () => {
+	const h = harness();
+	await h.command("local");
+	h.select(CLOUD());
+	const result = await h.emit("before_provider_request", {
+		type: "before_provider_request",
+		payload: { messages: [1] },
+	});
+	assert.deepEqual(result, {});
+	assert.equal(
+		h.notices.at(-1),
+		"🔒 Blocked a request from a locked session to anthropic/claude-sonnet-5; no session content was sent. Select privacy-router/auto.",
+	);
+});
+
+test("before_provider_request: router or private model in a locked session, or an unlocked session, passes", async () => {
+	const h = harness();
+	const event = { type: "before_provider_request", payload: { messages: [1] } };
+	h.select(CLOUD());
+	assert.equal(await h.emit("before_provider_request", event), undefined, "unlocked + cloud");
+	await h.command("local");
+	h.select(find("privacy-router", "auto"));
+	assert.equal(await h.emit("before_provider_request", event), undefined, "locked + router");
+	h.select(PRIVATE());
+	assert.equal(await h.emit("before_provider_request", event), undefined, "locked + private");
+});
+
+test("session_before_compact: a locked session with a cloud model selected cancels", async () => {
+	const h = harness();
+	const { branch, event } = lockedHandoff();
+	h.replaceBranch(branch);
+	h.select(CLOUD());
+	assert.deepEqual(await h.emit("session_before_compact", event), { cancel: true });
+	assert.match(h.notices.at(-1) ?? "", /anthropic\/claude-sonnet-5/);
+});
+
+function treeEvent(userWantsSummary: boolean) {
+	return {
+		type: "session_before_tree",
+		preparation: {
+			targetId: "t",
+			oldLeafId: "old-leaf",
+			commonAncestorId: null,
+			entriesToSummarize: [],
+			userWantsSummary,
+		},
+		signal: new AbortController().signal,
+	};
+}
+
+test("session_before_tree: a summary of a locked branch with a cloud model selected cancels", async () => {
+	const h = harness();
+	const locked: Entry[] = [{ type: "custom", customType: COMMAND_ENTRY, data: { kind: "lock" } }];
+	h.setBranchAt((fromId) => (fromId === "old-leaf" ? locked : h.entries));
+	h.select(CLOUD());
+	assert.deepEqual(await h.emit("session_before_tree", treeEvent(true)), { cancel: true });
+	assert.equal(
+		h.notices.at(-1),
+		"A summary of a private branch would go to anthropic/claude-sonnet-5; navigate without a summary or select privacy-router/auto.",
+	);
+	assert.equal(await h.emit("session_before_tree", treeEvent(false)), undefined, "no summary requested");
+});
+
+test("session_before_tree: an unlocked branch, or a private model, is left alone", async () => {
+	const h = harness();
+	h.select(CLOUD());
+	assert.equal(await h.emit("session_before_tree", treeEvent(true)), undefined, "unlocked branch");
+	const locked: Entry[] = [{ type: "custom", customType: COMMAND_ENTRY, data: { kind: "lock" } }];
+	h.setBranchAt(() => locked);
+	h.select(PRIVATE());
+	assert.equal(await h.emit("session_before_tree", treeEvent(true)), undefined, "private model");
+});
+
+const lockEntry: Entry = { type: "custom", customType: COMMAND_ENTRY, data: { kind: "lock" } };
+const providerEvent = { type: "before_provider_request", payload: { messages: [1] } };
+
+test("an invalid config allows only the router in a locked session, even the private model", async () => {
+	await withConfig({ minProb: 2 }, async () => {
+		const h = harness();
+		h.replaceBranch([lockEntry]);
+		h.select(PRIVATE());
+		assert.deepEqual(await h.emit("before_provider_request", providerEvent), {});
+		await h.emit("session_start", { type: "session_start", reason: "resume" });
+		assert.equal(h.selected()?.provider, "privacy-router");
+		assert.equal(await h.emit("before_provider_request", providerEvent), undefined, "router passes");
+	});
+});
+
+test("an unreadable branch counts as locked: a cloud model is switched off and blocked", async () => {
+	const h = harness();
+	h.breakBranch(true);
+	h.select(CLOUD());
+	assert.deepEqual(await h.emit("before_provider_request", providerEvent), {});
+	await h.emit("session_start", { type: "session_start", reason: "resume" });
+	assert.equal(h.selected()?.provider, "privacy-router");
+});
+
+test("session_before_tree: an unreadable old leaf counts as locked even when the current branch is not", async () => {
+	const h = harness();
+	h.breakBranchAt(true);
+	h.select(CLOUD());
+	assert.deepEqual(await h.emit("session_before_tree", treeEvent(true)), { cancel: true });
+	const nullLeaf = treeEvent(true);
+	nullLeaf.preparation.oldLeafId = null as never;
+	assert.deepEqual(await h.emit("session_before_tree", nullLeaf), { cancel: true });
+});
+
+test("when pi refuses the switch, the lock says so instead of claiming it switched, and the backstop blocks", async () => {
+	const h = harness();
+	await h.command("local");
+	h.select(CLOUD());
+	h.setModelResult(false);
+	const before = h.notices.length;
+	await h.emit("session_start", { type: "session_start", reason: "resume" });
+	const added = h.notices.slice(before);
+	assert.equal(added.length, 1);
+	assert.match(added[0], /locked to local/);
+	assert.match(added[0], /anthropic\/claude-sonnet-5 will be blocked/);
+	assert.ok(!added[0].includes("switched"));
+	assert.deepEqual(await h.emit("before_provider_request", providerEvent), {});
+});
+
+test("/local switches a selected cloud model to the router", async () => {
+	const h = harness();
+	h.select(CLOUD());
+	await h.command("local");
+	assert.equal(h.selected()?.provider, "privacy-router");
+	assert.ok(
+		h.notices.some((notice) => /switched from anthropic\/claude-sonnet-5 to privacy-router\/auto/.test(notice)),
+	);
+});
+
+const localReply = {
+	role: "assistant",
+	content: [],
+	provider: "ollama",
+	model: "qwen3.6:35b-pi",
+	stopReason: "stop",
+};
+const isCloud = (provider: string, model: string) => provider === "anthropic" && model === "claude-sonnet-5";
+
+test("deltaText starts after the last successful cloud reply, not after a local one", () => {
+	const messages = [user("first"), assistant, user("second"), localReply, user("third")];
+	assert.equal(deltaText(messages as never, isCloud).user, "second\nthird");
+});
+
+test("deltaText: errored and aborted cloud replies never anchor", () => {
+	const errored = { ...assistant, stopReason: "error" };
+	const aborted = { ...assistant, stopReason: "aborted" };
+	const messages = [user("first"), assistant, user("second"), errored, user("third"), aborted, user("fourth")];
+	assert.equal(deltaText(messages as never, isCloud).user, "second\nthird\nfourth");
+});
+
+test("deltaText: with no cloud reply the whole transcript is the delta", () => {
+	const messages = [user("first"), localReply, toolResult("tool out"), user("second")];
+	const delta = deltaText(messages as never, isCloud);
+	assert.equal(delta.user, "first\nsecond");
+	assert.equal(delta.tool, "tool out");
+});
+
+test("H2: text written on a local model is scanned once the router goes back to a cloud model", async () => {
+	const h = harness();
+	const token = `ghp_${"a1B2c3D4e5".repeat(4)}`;
+	const result = await h.route({
+		reason: "user",
+		messages: [user("hello"), assistant, user(`#private ${token}`), localReply, user("unrelated")],
+	});
+	assert.equal(result.model.provider, "ollama");
+	assert.equal((result.state as { locked: boolean }).locked, true);
+	assert.equal(ollama.piiCalls, 0, "deterministic lock happens before any classifier call");
+});
+
+test("H2: a reply from the router itself never anchors the delta", async () => {
+	const h = harness();
+	const routerReply = { ...assistant, provider: "privacy-router", model: "auto", stopReason: "stop" };
+	const messages = [user("#private early note"), routerReply, user("unrelated")];
+	const result = await h.route({ reason: "user", messages });
+	assert.equal(result.model.provider, "ollama");
+});
+
+test("classifier outage: the refusal covers not running, still loading and timeouts", async () => {
+	const h = harness();
+	ollama.down = true;
+	await assert.rejects(
+		h.route({ reason: "user", messages: [user("hello")] }),
+		(error: Error) =>
+			error instanceof RouterError &&
+			error.message ===
+				"Privacy check unavailable: the local classifier did not answer (not running, still loading, or too slow). Start Ollama, or wait for the model to load, and resend. The classifier settings are under ollama in privacy-router.json.",
+	);
+});
+
+test("H2: a model missing from pi's registry is not treated as a cloud anchor", async () => {
+	const h = harness();
+	const unknownReply = { ...assistant, provider: "mystery", model: "unknown" };
+	const result = await h.route({
+		reason: "user",
+		messages: [user("hello"), unknownReply, user("#private note"), unknownReply, user("unrelated")],
+	});
+	assert.equal(result.model.provider, "ollama");
+});
+
+test("H3: personal data only in the first window of a long message locks the session", async () => {
+	const h = harness();
+	ollama.piiMarker = "MARKER-IN-HEAD";
+	const text = `MARKER-IN-HEAD ${"x ".repeat(MAX_CLASSIFY_CHARS)}`;
+	assert.ok(text.length > MAX_CLASSIFY_CHARS * 2);
+	const result = await h.route({ reason: "user", messages: [user(text)] });
+	assert.equal(result.model.provider, "ollama");
+	assert.equal(ollama.piiCalls, 1, "stops at the first yes");
+});
+
+test("H3: a long message with no personal data in any window is classified window by window and routes on", async () => {
+	const h = harness();
+	ollama.piiMarker = "NEVER-PRESENT";
+	const result = await h.route({ reason: "user", messages: [user("x ".repeat(MAX_CLASSIFY_CHARS))] });
+	assert.equal(result.model.provider, "anthropic");
+	assert.ok(ollama.piiCalls >= 3);
+});
+
+test("H3: an error in any window fails the whole privacy check", async () => {
+	const h = harness();
+	ollama.pii = "maybe";
+	await assert.rejects(h.route({ reason: "user", messages: [user("x ".repeat(MAX_CLASSIFY_CHARS))] }), RouterError);
+});
+
+const overCap = () => "x ".repeat(MAX_CLASSIFY_CHARS * MAX_PII_WINDOWS);
+
+test("H3: a message over the window cap is refused with advice and never reaches the classifier", async () => {
+	const h = harness();
+	await assert.rejects(
+		h.route({ reason: "user", messages: [user(overCap())] }),
+		(error: Error) =>
+			error instanceof RouterError &&
+			/^Text since the last cloud reply is too long to check for personal information\. Add #private to keep this session on the local model, use \/tree without a summary to go back to before the long text, or start a new session\.$/.test(
+				error.message,
+			),
+	);
+	assert.equal(ollama.piiCalls, 0);
+});
+
+test("H3: a too-long message proceeds with a notice under onPrivacyCheckFailure warn", async () => {
+	const h = harness();
+	const path = join(mkdtempSync(join(tmpdir(), "pi-router-warn-")), "router.json");
+	writeFileSync(path, JSON.stringify({ onPrivacyCheckFailure: "warn" }));
+	const previous = process.env.PI_PRIVACY_ROUTER_CONFIG;
+	process.env.PI_PRIVACY_ROUTER_CONFIG = path;
+	try {
+		const result = await h.route({ reason: "user", messages: [user(overCap())] });
+		assert.equal(result.model.provider, "anthropic");
+		assert.equal(ollama.piiCalls, 0);
+		assert.ok(
+			h.notices.some((n) =>
+				n.includes(
+					"⚠ text since the last cloud reply is too long to check for personal information; deterministic checks only",
+				),
+			),
+		);
+	} finally {
+		process.env.PI_PRIVACY_ROUTER_CONFIG = previous;
+	}
+});
+
+test("H3: #private on a too-long message still locks locally", async () => {
+	const h = harness();
+	const result = await h.route({ reason: "user", messages: [user(`#private ${overCap()}`)] });
+	assert.equal(result.model.provider, "ollama");
+});
+
+// Batch D: pi auto-retries a routing refusal whose text looks transient, as reason "retry" with no failed model.
+const cloudReply = { ...assistant, stopReason: "stop" };
+const routingRetry = (messages: unknown[]) => ({
+	reason: "retry",
+	previous: { model: CLOUD(), thinkingLevel: "medium" },
+	messages,
+});
+
+test("N1: a retry after a routing refusal is refused again while the classifier is down", async () => {
+	const h = harness();
+	ollama.down = true;
+	const messages = [user("hello"), cloudReply, user("my salary is 185k")];
+	await assert.rejects(h.route({ reason: "user", messages }), RouterError);
+	await assert.rejects(h.route(routingRetry(messages)), RouterError);
+});
+
+test("N1: a retry after a routing refusal locks when the classifier finds personal information", async () => {
+	const h = harness();
+	ollama.piiMarker = "salary";
+	const result = await h.route(routingRetry([user("hello"), cloudReply, user("my salary is 185k")]));
+	assert.equal(result.model.provider, "ollama");
+	assert.equal(h.hasLockCommand(), true);
+});
+
+test("N1: a retry after a routing refusal is routed as a new turn, by category", async () => {
+	const h = harness();
+	ollama.category = "live";
+	const result = await h.route(routingRetry([user("hello"), cloudReply, user("weather in Chicago now?")]));
+	assert.equal(result.model.id, "gpt-6-sol");
+});
+
+// Batch D: retries and summaries get the privacy check (no category call) on text since the last cloud reply.
+const providerFailure = {
+	model: CLOUD(),
+	thinkingLevel: "medium",
+	message: { ...assistant, stopReason: "error", errorMessage: "503 service unavailable" },
+};
+
+test("N2: a provider retry that carries a queued steering message with personal information locks", async () => {
+	const h = harness();
+	ollama.piiMarker = "salary";
+	ollama.category = "code";
+	const result = await h.route({
+		reason: "retry",
+		previous: { model: CLOUD(), thinkingLevel: "medium" },
+		failed: providerFailure,
+		messages: [user("hello"), cloudReply, user("refactor the parser"), user("also, my salary is 185k")],
+	});
+	assert.ok(ollama.piiCalls >= 1, "the privacy classifier ran");
+	assert.equal(result.model.provider, "ollama");
+	assert.equal(h.hasLockCommand(), true);
+	assert.equal(
+		ollama.calls.length,
+		ollama.piiCalls,
+		"no category call on a retry: the route stays with the failed model",
+	);
+});
+
+test("N3: a summary request with unchecked text is refused while the classifier is down", async () => {
+	const h = harness();
+	ollama.down = true;
+	await assert.rejects(
+		h.route({
+			reason: "direct",
+			previous: { model: CLOUD(), thinkingLevel: "medium" },
+			messages: [user("hello"), cloudReply, user("my salary is 185k")],
+		}),
+		RouterError,
+	);
+});
+
+test("retries and summaries with nothing new since the last cloud reply make no classifier call", async () => {
+	const h = harness();
+	ollama.down = true; // any classifier call would fail the check and refuse
+	const previous = { model: CLOUD(), thinkingLevel: "medium" };
+	const messages = [user("hello"), cloudReply];
+	const direct = await h.route({ reason: "direct", previous, messages });
+	assert.equal(direct.model.id, "claude-sonnet-5");
+	const retry = await h.route({ reason: "retry", previous, failed: providerFailure, messages });
+	assert.equal(retry.model.id, "claude-sonnet-5");
+	assert.deepEqual(ollama.calls, []);
+});
+
+test("a locked session's summaries and retries never call the classifier", async () => {
+	const h = harness();
+	await h.command("local");
+	ollama.down = true;
+	const previous = { model: CLOUD(), thinkingLevel: "medium" };
+	const messages = [user("hello"), cloudReply, user("my salary is 185k")];
+	assert.equal((await h.route({ reason: "direct", previous, messages })).model.provider, "ollama");
+	assert.equal(
+		(await h.route({ reason: "retry", previous, failed: providerFailure, messages })).model.provider,
+		"ollama",
+	);
+	assert.deepEqual(ollama.calls, []);
+});
+
+// Batch D: a locked session allows the configured private model only when it really is local.
+const cloudPrivate: Model = {
+	provider: "cloudco",
+	id: "c2",
+	baseUrl: "https://api.cloudco.example/v1",
+	api: "openai-completions",
+};
+
+test("N4: a locked session reverts /model to a configured private model that is not served from localhost", async () => {
+	await withConfig({ private: "cloudco/c2" }, async () => {
+		const h = harness([...models, cloudPrivate]);
+		await h.command("local");
+		await h.emit("model_select", { type: "model_select", model: cloudPrivate, source: "set" });
+		assert.equal(h.modelSets(), 1);
+		assert.equal(h.selected()?.provider, "privacy-router");
+	});
+});
+
+test("N4: a locked session blocks requests and compaction to a private model not served from localhost", async () => {
+	await withConfig({ private: "cloudco/c2" }, async () => {
+		const h = harness([...models, cloudPrivate]);
+		await h.command("local");
+		h.select(cloudPrivate);
+		assert.deepEqual(await h.emit("before_provider_request", providerEvent), {}, "the request body is emptied");
+		const { branch, event } = lockedHandoff();
+		h.replaceBranch(branch);
+		assert.deepEqual(await h.emit("session_before_compact", event), { cancel: true }, "compaction cancels");
+	});
+});
+
+test("N7: the router declares limits, so a refused route does not look like a full context", () => {
+	const definition = harness().virtualModel();
+	assert.ok((definition?.contextWindow ?? 0) > 0);
+	assert.ok((definition?.maxTokens ?? 0) > 0);
+});
+
+// Fix round 1: an extension can start a turn (pi.sendMessage with triggerTurn); pi routes it as a
+// continuation, and the text since the last cloud reply can hold unchecked or refused user text.
+const routerRefusal = { ...assistant, provider: "privacy-router", model: "auto", stopReason: "error" };
+const continuation = (messages: unknown[]) => ({
+	reason: "continuation",
+	previous: { model: CLOUD(), thinkingLevel: "medium" },
+	messages,
+});
+
+test("C1: an extension-started turn after a refusal is refused while the classifier is down", async () => {
+	const h = harness();
+	ollama.down = true;
+	const messages = [user("hello"), cloudReply, user("my salary is 185k"), routerRefusal, user("[ext] job finished")];
+	await assert.rejects(h.route(continuation(messages)), RouterError);
+});
+
+test("C1: an extension-started turn locks when the classifier finds personal information", async () => {
+	const h = harness();
+	ollama.piiMarker = "salary";
+	const messages = [user("hello"), cloudReply, user("my salary is 185k"), routerRefusal, user("[ext] job finished")];
+	const result = await h.route(continuation(messages));
+	assert.equal(result.model.provider, "ollama");
+	assert.equal(h.hasLockCommand(), true);
+	assert.equal(ollama.calls.length, ollama.piiCalls, "no category call on a continuation");
+});
+
+test("C1: an extension-started turn after a too-long refusal is refused again", async () => {
+	const h = harness();
+	const messages = [user("hello"), cloudReply, user(overCap()), routerRefusal, user("Background task finished")];
+	await assert.rejects(
+		h.route(continuation(messages)),
+		(error: Error) =>
+			error instanceof RouterError && error.message.startsWith("Text since the last cloud reply is too long"),
+	);
+	assert.equal(ollama.piiCalls, 0);
+});
+
+test("C1: shell output (!command) carried by an extension-started turn locks when it holds personal information", async () => {
+	const h = harness();
+	ollama.piiMarker = "diagnosis";
+	const bash = user("Ran `cat ~/notes/health.txt`\n```\ndiagnosis: type 2 diabetes\n```");
+	const result = await h.route(continuation([user("hello"), cloudReply, bash, user("Subagent finished")]));
+	assert.equal(result.model.provider, "ollama");
+	assert.equal(h.hasLockCommand(), true);
+});
+
+test("an ordinary tool-loop continuation makes no classifier call and stays on the previous model", async () => {
+	const h = harness();
+	ollama.down = true; // any classifier call would fail the check and refuse
+	const toolCall = { ...assistant, stopReason: "toolUse" };
+	const result = await h.route(continuation([user("hello"), cloudReply, user("read a.ts"), toolCall, toolResult("x")]));
+	assert.equal(result.model.id, "claude-sonnet-5");
+	assert.equal(result.state, undefined);
+	assert.deepEqual(ollama.calls, []);
+});
+
+// Fix round 1: with the router missing, a locked session falls back to the private model only when the lock allows it.
+const withoutRouter = models.filter((m) => m.provider !== "privacy-router");
+
+test("router missing, private model not on localhost: a locked session never selects it and says requests are blocked", async () => {
+	await withConfig({ private: "cloudco/c2" }, async () => {
+		const h = harness([...withoutRouter, cloudPrivate]);
+		await h.command("local");
+		await h.emit("model_select", { type: "model_select", model: CLOUD(), source: "set" });
+		assert.equal(h.modelSets(), 0, "/model: no switch to the cloud private model");
+		assert.equal(
+			h.notices.at(-1),
+			"🔒 This session is locked to local; requests to anthropic/claude-sonnet-5 will be blocked.",
+		);
+		h.select(CLOUD());
+		const noticesBeforeResume = h.notices.length;
+		await h.emit("session_start", { type: "session_start", reason: "resume" });
+		assert.equal(h.modelSets(), 0, "resume: no switch to the cloud private model");
+		assert.equal(h.selected()?.provider, "anthropic");
+		assert.ok(h.notices.length > noticesBeforeResume, "resume: a new notice, not the one /model left");
+		assert.match(h.notices.at(-1) ?? "", /requests to anthropic\/claude-sonnet-5 will be blocked/);
+		assert.deepEqual(await h.emit("before_provider_request", providerEvent), {});
+	});
+});
+
+test("router missing, private model on localhost: a locked session falls back to it", async () => {
+	const h = harness(withoutRouter);
+	await h.command("local");
+	await h.emit("model_select", { type: "model_select", model: CLOUD(), source: "set" });
+	assert.equal(h.selected()?.id, "qwen3.6:35b-pi");
+	h.select(CLOUD());
+	await h.emit("session_start", { type: "session_start", reason: "resume" });
+	assert.equal(h.selected()?.id, "qwen3.6:35b-pi");
 });
